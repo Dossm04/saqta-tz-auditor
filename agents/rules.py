@@ -12,7 +12,10 @@ from difflib import SequenceMatcher
 from knowledge.antipatterns import ANTIPATTERNS
 from knowledge.domains import OUT_OF_SCOPE
 from knowledge.fintech_controls import CONTROLS, Control
-from knowledge.language import CONFLICT_PAIRS, METRIC_PATTERNS, METRIC_QUALIFIERS, SEGMENTS, VAGUE_TERMS
+from knowledge.language import (BOUND_MAX, BOUND_MAX_WORDS, BOUND_MIN, BOUND_MIN_WORDS, CHANNEL_QUALIFIERS,
+                                CLIENT_QUALIFIERS, CONFLICT_PAIRS, METRIC_PATTERNS, METRIC_QUALIFIERS,
+                                NON_REQ_SECTIONS, POLARITY_CONFLICT, POLARITY_FAMILIES, SEGMENTS, STOPWORDS,
+                                TARGET_VERBS, VAGUE_TERMS, VALUE_CONFLICT, VALUE_PERIODS, WEAK_WORDS)
 from knowledge.tz_structure import SECTIONS, Section
 from models import Category, ControlCheck, Finding, Severity
 from parsing import Document
@@ -237,8 +240,12 @@ def scan_antipatterns(doc: Document, agent: str = "fintech_security") -> list[Fi
         # условие на уровне документа: например, «короткий ПИН» опасен, только если нигде нет политики попыток
         if absent and any(_rx(absent).search(l) for _, _, l in scoped):
             continue
+        affirmed = _rx(ap.unless_affirmed) if getattr(ap, "unless_affirmed", None) else None
+        by_sentence = getattr(ap, "scope", "line") == "sentence"
         for i, line, l in scoped:
-            if rx.search(l) and not (unless and unless.search(l)):
+            units = _sentences(l) if by_sentence else [l]
+            if any(rx.search(u) and not (unless and unless.search(u)) and not (affirmed and _positive_hit(affirmed, u))
+                   for u in units):
                 out.append(Finding(
                     agent=agent, category=Category(ap.category), severity=Severity(ap.severity),
                     title=f"Опасное требование: {ap.title}", description=ap.description,
@@ -251,6 +258,7 @@ def scan_antipatterns(doc: Document, agent: str = "fintech_security") -> list[Fi
 
 # ── Язык требований ───────────────────────────────────────────────────────────
 
+_UI_QUOTE = re.compile(r"«[^»\n]*»|“[^”\n]*”|\"[^\"\n]*\"")
 _NFR_CONTEXT = _rx(r"производительн|скорост|быстр|мгновенн|отклик|надежн|доступн|безопасн|нагрузк|пользовател|время|защищ")
 
 
@@ -263,7 +271,8 @@ def scan_vague(doc: Document) -> list[Finding]:
         l = _norm(line)
         if OUT_OF_SCOPE.search(l):
             continue  # «Мгновенные переводы не входят в рамки проекта» — не требование
-        body = strip_ids(l)
+        # текст в кавычках — сообщение интерфейса или название («Операция не может быть выполнена»), не требование
+        body = _UI_QUOTE.sub(lambda m: " " * len(m.group(0)), strip_ids(l))
         hits = []
         for rx, v in compiled:
             m = rx.search(body)
@@ -332,13 +341,13 @@ def _fmt(v: float) -> str:
     return f"{v:,.0f}".replace(",", " ") if v >= 10000 and v == int(v) else "%g" % v
 
 
-def scan_metric_conflicts(doc: Document, semantic: bool = True) -> list[Finding]:
+def scan_metric_conflicts(doc: Document, semantic: bool = True, generic: bool = True) -> list[Finding]:
     """Ищет разные значения одной и той же метрики в разных местах ТЗ.
 
     Значения сравниваются только внутри одного уточнителя (период лимита, рабочие/календарные дни)
-    и одного сегмента (упрощённая/полная идентификация и т.п.). При semantic=True к результату
-    добавляются смысловые противоречия (scan_semantic_conflicts) — так их получает и вызывающий код,
-    который знает только про scan_metric_conflicts."""
+    и одного сегмента (упрощённая/полная идентификация и т.п.). При generic=True добавляются обобщённые
+    численные противоречия (scan_value_conflicts) по любой теме, при semantic=True — смысловые
+    (scan_semantic_conflicts): так их получает и вызывающий код, который знает только про scan_metric_conflicts."""
     out = []
     lines = [(i, strip_ids(line).replace("ё", "е").lower()) for i, line in enumerate(doc.lines, start=1)
              if line.strip() and not _out_of_scope(line)]
@@ -377,6 +386,8 @@ def scan_metric_conflicts(doc: Document, semantic: bool = True) -> list[Finding]
             lines_ = sorted({n for ns in vals.values() for n in ns})
             if len(lines_) < 2:
                 continue  # разные значения в одной строке — это обычно диапазон, а не противоречие
+            if len(lines_) == 2 and _parallel_lines(doc, *lines_):
+                continue  # «время ответа API скоринга» / «время ответа API отчётов» — разные параметры
             quals = "; ".join(x for x in (q, seg) if x)
             label = metric + (f" ({quals})" if quals else "")
             shown = ", ".join(f"{_fmt(v)} (L{', L'.join(map(str, ns[:2]))})" for v, ns in vals.items())
@@ -391,6 +402,10 @@ def scan_metric_conflicts(doc: Document, semantic: bool = True) -> list[Finding]
                 question=f"Какое значение метрики «{label}» верное: {shown}?",
                 confidence=0.5 if weak else 0.7,
             ))
+    if generic:
+        # пары строк, уже покрытые специфичной метрикой, обобщённый детектор не дублирует
+        covered = {(x, y) for f in out for x in f.lines for y in f.lines if x < y}
+        out += scan_value_conflicts(doc, exclude=covered)
     if semantic:
         out += scan_semantic_conflicts(doc)
     return out
@@ -441,6 +456,551 @@ def scan_semantic_conflicts(doc: Document) -> list[Finding]:
                 recommendation=cp.recommendation,
                 question=cp.question.format(**fmt),
                 control_id=cp.id, confidence=0.7,
+            ))
+    # обобщённая полярность (CP-POLARITY) не дублирует пары строк, уже найденные специфичными парами
+    covered = {(min(f.lines), max(f.lines)) for f in out if len(f.lines) >= 2}
+    out += [f for f in scan_polarity_conflicts(doc) if (min(f.lines), max(f.lines)) not in covered]
+    return out
+
+
+# ── Обобщённые противоречия: тема утверждения ────────────────────────────────
+# Тема сравнивается по основам содержательных слов (лёгкий стеммер: снятие окончания + 5 символов),
+# поэтому «срок хранения резерва» и «резерв хранится» совпадают, а слова конкретной метрики не нужны.
+
+_WORD_RX = re.compile(r"[^\W\d_]+")
+_ENDINGS = tuple(sorted({
+    "ировать", "ирования", "ированн", "ирует", "ируют", "ировал", "ирован",
+    "ениями", "ениях", "ением", "ения", "ение", "ению", "ении", "аниями", "ании", "ание", "ания", "анием", "анию",
+    "остями", "остью", "ость", "ости", "ациями", "ация", "ации", "ацию", "ацией",
+    "иями", "иях", "иям", "ией", "ия", "ию",
+    "ями", "ами", "ого", "его", "ому", "ему", "ыми", "ими", "ой", "ей", "ом", "ем", "ах", "ях", "ам", "ям",
+    "ов", "ев", "ую", "юю", "ая", "яя", "ое", "ее", "ые", "ие", "ый", "ий", "ых", "их", "ым", "им",
+    "ает", "яет", "ует", "ют", "ят", "ут", "ет", "ит", "ать", "ять", "ить", "еть", "ал", "ил", "ла", "ли",
+    "а", "я", "о", "е", "у", "ю", "ы", "и", "ь", "й",
+}, key=len, reverse=True))
+_ABBR = ((re.compile(r"\bмин\.(?=\s*[^\W\d])", re.IGNORECASE), "минимальная"),
+         (re.compile(r"\bмакс\.(?=\s*[^\W\d])", re.IGNORECASE), "максимальная"))
+
+
+# двухбуквенные глагольные окончания совпадают с концом коротких существительных (кредит, лимит, отчёт, канал):
+# у них они снимаются только у возвратных глаголов («хранится») или если остаётся длинная основа
+_VERB2 = frozenset({"ит", "ет", "ат", "ут", "ют", "ят", "ал", "ил", "ла", "ли"})
+
+
+def stem(word: str) -> str:
+    """Основа слова для сравнения тем: без возвратной частицы и окончания, не длиннее 5 символов."""
+    w = word.lower().replace("ё", "е")
+    reflexive = len(w) > 5 and w.endswith(("ся", "сь"))
+    if reflexive:
+        w = w[:-2]
+    for e in _ENDINGS:
+        if not w.endswith(e):
+            continue
+        rest = len(w) - len(e)
+        if rest < (3 if len(e) == 1 else 4) or (e in _VERB2 and not reflexive and rest < 5):
+            continue
+        w = w[: -len(e)]
+        break
+    return w[:5]
+
+
+_STOP_STEMS = frozenset(stem(w) for w in STOPWORDS)
+_WEAK_STEMS = frozenset(stem(w) for w in WEAK_WORDS) - _STOP_STEMS
+
+
+def content_stems(text: str) -> list[str]:
+    """Основы содержательных слов по порядку: слова от 4 букв (аббревиатуры QR/KYB/АФМ — от 2), без служебных."""
+    for rx, full in _ABBR:
+        text = rx.sub(full, text)
+    out = []
+    for m in _WORD_RX.finditer(text):
+        w = m.group(0)
+        if len(w) < 4 and not (len(w) >= 2 and w.isupper()):
+            continue
+        s = stem(w)
+        if s not in _STOP_STEMS:
+            out.append(s)
+    return out
+
+
+def _strong(stems) -> set[str]:
+    return set(stems) - _WEAK_STEMS
+
+
+_QUOTED = re.compile(r"«([^»]{2,40})»")
+_SENT_END = re.compile(r";|\.(?=\s+[«\"(]?[А-ЯЁA-Z0-9])|\.\s*$")
+
+
+def _sentence_span(l: str, pos: int) -> tuple[int, int]:
+    """Границы предложения (до «;» или точки перед заглавной), в котором стоит позиция pos."""
+    left = 0
+    for m in _SENT_END.finditer(l, 0, pos):
+        left = m.end()
+    m = _SENT_END.search(l, pos)
+    return left, (m.start() if m else len(l))
+
+
+def _sentences(l: str) -> list[str]:
+    out, pos = [], 0
+    while pos < len(l):
+        s0, s1 = _sentence_span(l, pos)
+        if l[s0:s1].strip():
+            out.append(l[s0:s1])
+        pos = max(s1 + 1, pos + 1)
+    return out
+
+
+def _qualifiers(text: str) -> frozenset[str]:
+    t = text.lower()
+    return frozenset(n for d in (SEGMENTS, CLIENT_QUALIFIERS) for n, p in d.items() if re.search(p, t))
+
+
+def _channels(text: str) -> frozenset[str]:
+    t = text.lower()
+    return frozenset(n for n, p in CHANNEL_QUALIFIERS.items() if re.search(p, t))
+
+
+def _products(text: str) -> frozenset[str]:
+    return frozenset(q.strip().lower() for q in _QUOTED.findall(text))
+
+
+def _req_lines(doc: Document) -> list[tuple[int, str]]:
+    """Строки-требования: без заголовков, строк вне скоупа и разделов целей/этапов/рисков
+    (там числа — бизнес-цели и план работ, а не требования к системе)."""
+    out, skip = [], False
+    for i, line in enumerate(doc.lines, start=1):
+        if not line.strip():
+            continue
+        if _is_heading(line):
+            title = _norm(strip_ids(_MD_HEADING.sub("", line))).strip().lower()
+            skip = bool(re.search(NON_REQ_SECTIONS, title))
+            continue
+        if skip or _out_of_scope(line):
+            continue
+        out.append((i, line))
+    return out
+
+
+def _tables(doc: Document) -> dict[int, tuple[list[str], list[str]]]:
+    """Строки markdown-таблиц: номер строки → (ячейки заголовка, ячейки строки). Заголовок — первая строка блока."""
+    out: dict[int, tuple[list[str], list[str]]] = {}
+    header: list[str] | None = None
+    for i, line in enumerate(doc.lines, start=1):
+        s = line.strip()
+        if not s.startswith("|"):
+            header = None
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if all(re.fullmatch(r":?-{2,}:?|", c) for c in cells):
+            continue
+        if header is None:
+            header = cells
+            continue
+        out[i] = (header, cells)
+    return out
+
+
+def _shared_ok(a: set[str], b: set[str], n: int = 2) -> bool:
+    return len(_strong(a & b)) >= n
+
+
+# ── Обобщённые численные противоречия ────────────────────────────────────────
+
+_VALUE_RX = re.compile(
+    r"(?<![\w.,+/:№-])(?P<num>\d{1,3}(?:[   ]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?)"
+    r"(?:\s*(?P<mult>тыс\.?|млн\.?|млрд\.?)(?!\w))?"
+    r"(?:\s*(?P<kind>календарн\w*|рабоч\w*|банковск\w*))?"
+    r"\s*(?P<unit>₸|тенге\b|тг\b|kzt\b|usd\b|\$|долл\w*|eur\b|€|евро\b|руб\w*|rub\b|мрп\b|%|процент\w*|"
+    r"мс\b|ms\b|миллисек\w*|сек\w*|минут\w*|мин(?:\.|\b)|час\w*|дн(?:ей|я|ю|ями|ях)\b|день\b|сут\w*|недел\w*|"
+    r"месяц\w*|мес(?:\.|\b)|лет\b|год(?:а|ов)?\b)",
+    re.IGNORECASE,
+)
+_T_PLUS = re.compile(r"(?<!\w)[TТ]\s*\+\s*(?P<num>\d{1,2})(?!\d)")
+_DUR = (("мс", 0.001), ("ms", 0.001), ("миллисек", 0.001), ("сек", 1), ("мин", 60), ("час", 3600), ("дн", 86400),
+        ("ден", 86400), ("сут", 86400), ("недел", 604800), ("мес", 2592000), ("лет", 31536000), ("год", 31536000))
+_CUR = (("₸", "KZT"), ("тенге", "KZT"), ("тг", "KZT"), ("kzt", "KZT"), ("usd", "USD"), ("$", "USD"), ("долл", "USD"),
+        ("eur", "EUR"), ("€", "EUR"), ("евро", "EUR"), ("руб", "RUB"), ("rub", "RUB"), ("мрп", "MRP"))
+
+
+@dataclass
+class _Value:
+    line: int
+    raw: str
+    cls: str                 # money:KZT / pct / dur
+    val: float
+    kind: str                # рабочие (bd) / календарные (cd) дни
+    direction: str           # min / max / exact
+    core: frozenset[str]     # тема клаузы значения
+    sent: frozenset[str]     # тема предложения
+    head: str                # первое содержательное слово предложения (обычно подлежащее)
+    words: tuple[tuple[str, str], ...]  # (слово, основа) клаузы — для заголовка находки
+    period: frozenset[str]
+    quals: frozenset[str]
+    chans: frozenset[str]
+    prods: frozenset[str]
+    seq: tuple[str, ...] = ()  # содержательные основы темы по порядку — для распознавания параллельных требований
+    verbs: frozenset[str] = frozenset()  # основы глаголов темы («хранится», «возвращаются»)
+
+
+_VERB_FORM = re.compile(r"(?:ся|сь|ает|яет|ует|ать|ять|ить|еть)$")
+_VERB_FORM2 = re.compile(r"(?:ит|ет|ют|ят|ут|ат)$")   # как у существительных «кредит», «бюджет» — только у длинных слов
+
+
+def _verb_stems(text: str) -> frozenset[str]:
+    return frozenset(stem(w) for w, _ in _words(text)
+                     if (len(w) >= 6 and _VERB_FORM.search(w.lower())) or (len(w) >= 8 and _VERB_FORM2.search(w.lower())))
+
+
+def _parallel(a: _Value, b: _Value) -> bool:
+    """Однотипные требования с разными уточнениями: «время ответа API скоринга» / «время ответа торгового API» /
+    «время ответа API отчётов». Главное слово (первое) общее, а каждая сторона отличается 1–2 своими
+    определениями-существительными — это разные параметры. Если различие в сказуемом («резерв хранится 14 дней» /
+    «резерв возвращается через 30 дней») — это одно и то же, сказанное по-разному, и значения сравниваются.
+    Общий только конец («доступность шлюза» / «SLA шлюза») — тот же объект."""
+    if not a.seq or not b.seq or a.seq[0] != b.seq[0]:
+        return False
+    ra, rb = set(a.seq) - set(b.seq), set(b.seq) - set(a.seq)
+    return 0 < len(ra) <= 2 and 0 < len(rb) <= 2 and not ((ra | rb) & (a.verbs | b.verbs))
+
+
+def _parallel_lines(doc: Document, la: int, lb: int) -> bool:
+    """Значения одного класса в двух строках относятся к однотипным, но разным параметрам (см. _parallel)."""
+    tables = _tables(doc)
+    va = _line_values(la, doc.line(la), tables.get(la))
+    vb = _line_values(lb, doc.line(lb), tables.get(lb))
+    pairs = [(x, y) for x in va for y in vb if x.cls == y.cls]
+    return bool(pairs) and all(_parallel(x, y) for x, y in pairs)
+
+
+def _parse_value(m: re.Match) -> tuple[str, float, str] | None:
+    try:
+        num = float(re.sub(r"[   ]", "", m.group("num")).replace(",", "."))
+    except ValueError:
+        return None
+    unit = m.group("unit").lower()
+    mult = (m.group("mult") or "").lower()
+    kind = (m.group("kind") or "").lower()
+    kind = "bd" if kind.startswith(("рабоч", "банков")) else "cd" if kind.startswith("календ") else ""
+    if unit.startswith(("%", "процент")):
+        return "pct", num, ""
+    for p, code in _CUR:
+        if unit.startswith(p):
+            num *= {"тыс": 1e3, "млн": 1e6, "млрд": 1e9}.get(mult.rstrip("."), 1.0)
+            return f"money:{code}", num, ""
+    if mult:
+        return None
+    if unit.startswith(("год", "лет")) and 1900 <= num <= 2100:
+        return None              # «к концу 2027 года» — дата, а не срок
+    for p, k in _DUR:
+        if unit.startswith(p):
+            return "dur", num * k, kind
+    return None
+
+
+def _direction(prefix: str, context: str) -> str:
+    p = prefix.lower().rstrip()
+    if re.search(r"(?:^|[\s(—–-])" + BOUND_MAX + r"$", p[-30:]):
+        return "max"
+    if re.search(r"(?:^|[\s(—–-])" + BOUND_MIN + r"$", p[-30:]):
+        return "min"
+    c = context.lower()
+    mx, mn = bool(re.search(BOUND_MAX_WORDS, c)), bool(re.search(BOUND_MIN_WORDS, c))
+    return "max" if mx and not mn else "min" if mn and not mx else "exact"
+
+
+def _comma_span(l: str, pos: int, s0: int, s1: int) -> tuple[int, int]:
+    """Границы части предложения [s0, s1) между запятыми, в которой стоит позиция pos."""
+    left = max(l.rfind(",", s0, pos), s0 - 1) + 1
+    right = min([p for p in (l.find(",", pos, s1),) if p != -1] or [s1])
+    return left, right
+
+
+def _blank_values(l: str) -> str:
+    l = _VALUE_RX.sub(lambda m: " " * len(m.group(0)), l)
+    return _T_PLUS.sub(lambda m: " " * len(m.group(0)), l)
+
+
+def _words(text: str) -> tuple[tuple[str, str], ...]:
+    for rx, full in _ABBR:
+        text = rx.sub(full, text)
+    return tuple((m.group(0), stem(m.group(0))) for m in _WORD_RX.finditer(text)
+                 if len(m.group(0)) >= 4 or (len(m.group(0)) >= 2 and m.group(0).isupper()))
+
+
+def _line_values(i: int, line: str, table: tuple[list[str], list[str]] | None) -> list[_Value]:
+    out: list[_Value] = []
+    if table is not None:
+        header, cells = table
+        if not cells or not cells[0]:
+            return out
+        for j, cell in enumerate(cells[1:], start=1):
+            label = f"{cells[0]} {header[j] if j < len(header) else ''}"
+            out += _scan_values(i, _norm(cell), label=_norm(label))
+        return out
+    return _scan_values(i, _norm(strip_ids(line)))
+
+
+def _scan_values(i: int, l: str, label: str = "") -> list[_Value]:
+    """Значения с единицей в тексте l. label — подпись ячейки таблицы (первая ячейка строки + заголовок столбца):
+    тогда тема значения — подпись, а не текст ячейки."""
+    out: list[_Value] = []
+    blank = _blank_values(l)
+    matches = [(m, _parse_value(m)) for m in _VALUE_RX.finditer(l)]
+    matches += [(m, ("dur", float(m.group("num")) * 86400, "bd")) for m in _T_PLUS.finditer(l)]
+    for m, parsed in matches:
+        if not parsed:
+            continue
+        cls, val, kind = parsed
+        s0, s1 = _sentence_span(l, m.start())
+        sentence = l[s0:s1]
+        if re.search(TARGET_VERBS, sentence.lower()):
+            continue             # «сократить срок с 5 до 1 дня» — цель, а не требование
+        c0, c1 = _clause_span(l, m.start(), m.end())
+        c0, c1 = max(c0, s0), min(c1, s1)
+        # часть предложения между запятыми: «Максимальная сумма … — 5 000 000 ₸» — слово границы и период стоят до тире
+        k0, k1 = _comma_span(l, m.start(), s0, s1)
+        comma = l[k0:k1]
+        if label:
+            core_text, sent_text = label, f"{label} {blank}"
+            prefix = ctx = f"{label} {l[:m.start()]}"
+        else:
+            core_text, sent_text = blank[c0:c1], blank[s0:s1]
+            prefix, ctx = l[c0:m.start()], l[k0:m.start()]   # граница рядом с числом / слово границы в части предложения
+        core = content_stems(core_text)
+        if len(_strong(core)) < 2:   # короткая клауза («(20 000 ₸ по вкладам)») — тема берётся из предложения
+            core_text = sent_text
+            core = content_stems(core_text)
+        sent = content_stems(sent_text)
+        head = next((s for s in sent if s not in _WEAK_STEMS), "")
+        # продукт значения: в его части предложения, иначе ближайший слева («по карте «А» — 1 000 ₸, по карте «Б» — 5 000 ₸»)
+        prods = _products(label + " " + comma) or frozenset(
+            q.strip().lower() for q in _QUOTED.findall(l[s0:m.start()])[-1:]) or _products(sentence)
+        out.append(_Value(
+            line=i, raw=m.group(0).strip(), cls=cls, val=val, kind=kind, direction=_direction(prefix, ctx),
+            core=frozenset(core), sent=frozenset(sent), head=head, words=_words(core_text),
+            # период (сутки/месяц/операция) уточняет суммы и проценты; у сроков «ежедневно» — частота, а не период.
+            # Ищется в части предложения между запятыми: «Лимит в сутки — 500 000 ₸» — период слева от тире.
+            period=frozenset() if cls == "dur" else
+            frozenset(n for n, p in VALUE_PERIODS.items() if re.search(p, (label + " " + comma).lower())),
+            quals=_qualifiers(label + " " + sentence), chans=_channels(label + " " + sentence), prods=prods,
+            seq=tuple(s for s in core if s not in _WEAK_STEMS), verbs=_verb_stems(core_text),
+        ))
+    return out
+
+
+_VALUE_SUBJECT_MIN = 0.6      # доля темы одной клаузы, найденная в предложении другой
+_VALUE_SUBJECT_HEAD = 0.5     # порог, если совпадает и главное слово (подлежащее) обоих предложений
+
+
+def _value_subject_score(a: _Value, b: _Value) -> float:
+    """Похожесть темы двух значений: ≥2 общих содержательных основы и доля темы клаузы одного значения,
+    найденная в предложении другого. 0 — темы разные."""
+    if not _shared_ok(set(a.sent), set(b.sent)) or _parallel(a, b):
+        return 0.0
+    ca = len(a.core & b.sent) / len(a.core) if a.core else 0.0
+    cb = len(b.core & a.sent) / len(b.core) if b.core else 0.0
+    score = max(ca, cb)
+    if score >= _VALUE_SUBJECT_MIN or (score >= _VALUE_SUBJECT_HEAD and a.head and a.head == b.head):
+        return score
+    return 0.0
+
+
+def _values_comparable(a: _Value, b: _Value) -> bool:
+    if a.line == b.line or a.cls != b.cls:
+        return False
+    if a.kind and b.kind and a.kind != b.kind:
+        return False             # рабочие vs календарные дни явно различаются
+    if a.period != b.period or a.quals != b.quals:
+        return False             # другой период (сутки/операция) или сегмент клиентов
+    if a.chans and b.chans and not (a.chans & b.chans):
+        return False
+    if a.prods and b.prods and not (a.prods & b.prods):
+        return False             # разные продукты/категории
+    return True
+
+
+def _values_conflict(a: _Value, b: _Value) -> bool:
+    if abs(a.val - b.val) <= 1e-9 * max(abs(a.val), abs(b.val), 1.0):
+        return False
+    if {a.direction, b.direction} == {"min", "max"}:
+        lo, hi = (a, b) if a.direction == "min" else (b, a)
+        return lo.val > hi.val   # «не менее X» и «не более Y» совместимы, пока X ≤ Y
+    return True
+
+
+def _subject_phrase(a: _Value, b: _Value) -> str:
+    shared = _strong(a.core & b.sent) or _strong(a.sent & b.sent)
+    seen, words = set(), []
+    for w, s in a.words:
+        if s in shared and s not in seen:
+            seen.add(s)
+            words.append(w.lower())
+    return " ".join(words[:6])
+
+
+def scan_value_conflicts(doc: Document, exclude: set[tuple[int, int]] | None = None) -> list[Finding]:
+    """Обобщённые численные противоречия: одно и то же значение (сумма, %, срок) для одной темы задано
+    в разных строках по-разному. Тема — основы содержательных слов клаузы/предложения (для таблиц —
+    первая ячейка строки и заголовок столбца). Не сравниваются: разные единицы и валюты, разные периоды
+    (сутки/месяц/операция), сегменты и классы клиентов, разные продукты в кавычках; «не менее X» и
+    «не более Y» при X ≤ Y; строки целей и плана работ. exclude — пары строк, уже найденные специфичными метриками."""
+    tables = _tables(doc)
+    values = [v for i, line in _req_lines(doc) for v in _line_values(i, line, tables.get(i))]
+    best: dict[tuple[int, int], tuple[float, _Value, _Value]] = {}
+    for x in range(len(values)):
+        for y in range(x + 1, len(values)):
+            a, b = values[x], values[y]
+            if not _values_comparable(a, b) or not _values_conflict(a, b):
+                continue
+            score = _value_subject_score(a, b)
+            if not score:
+                continue
+            key = (min(a.line, b.line), max(a.line, b.line))
+            if exclude and key in exclude:
+                continue
+            if key not in best or score > best[key][0]:
+                best[key] = (score, a, b) if a.line < b.line else (score, b, a)
+    out = []
+    for (la, lb), (score, a, b) in sorted(best.items()):
+        subj = _subject_phrase(a, b) or "параметр"
+        out.append(Finding(
+            agent="consistency", category=Category.contradiction, severity=Severity.major,
+            title=f"Противоречивые значения: {subj}",
+            description=f"Для «{subj}» указаны разные значения: {a.raw} (L{la}) и {b.raw} (L{lb}). {VALUE_CONFLICT.why}",
+            evidence=[_clip(doc.line(la)), _clip(doc.line(lb))], lines=[la, lb],
+            recommendation=VALUE_CONFLICT.recommendation,
+            question=f"Какое значение верное для «{subj}»: {a.raw} (L{la}) или {b.raw} (L{lb})?",
+            control_id=VALUE_CONFLICT.id, confidence=round(0.55 + 0.15 * min(1.0, score), 2),
+        ))
+    return out
+
+
+# ── Обобщённые смысловые противоречия: противоположная модальность ────────────
+
+@dataclass
+class _Polar:
+    line: int
+    family: int
+    side: str                # neg / pos
+    text: str
+    topic: frozenset[str]    # тема предложения без слов-маркеров
+    focus: frozenset[str]    # объект маркера: слова внутри маркера и по 3 содержательных слова вокруг
+    line_topic: frozenset[str]
+    quals: frozenset[str]
+    chans: frozenset[str]
+    prods: frozenset[str]
+    anchors: frozenset[tuple[str, str]] = frozenset()   # («до»/«после», основа события)
+
+
+_EXCEPTION = re.compile(r"\bкроме\b|\bза исключением\b|\bисключени")
+_BEFORE = re.compile(r"\bдо\s+(?:момента\s+)?([^\W\d_]{4,})", re.IGNORECASE)
+_AFTER = re.compile(r"\b(?:после|с момента|по истечении|по окончании|по завершении)\s+([^\W\d_]{4,})", re.IGNORECASE)
+
+
+def _anchors(text: str) -> frozenset[tuple[str, str]]:
+    return frozenset([("до", stem(m.group(1))) for m in _BEFORE.finditer(text)]
+                     + [("после", stem(m.group(1))) for m in _AFTER.finditer(text)])
+
+
+def _time_split(a: frozenset[tuple[str, str]], b: frozenset[tuple[str, str]]) -> bool:
+    """«До списания можно отменить» и «после списания безотзывно» делят время по одному событию — не противоречие."""
+    return any((("после" if k == "до" else "до"), s) in b for k, s in a)
+
+
+def _focus(sentence: str, start: int, end: int, keep_inside: bool) -> set[str]:
+    before = content_stems(sentence[:start])[-3:]
+    after = content_stems(sentence[end:])[:3]
+    inside = content_stems(sentence[start:end]) if keep_inside else []
+    return set(before + after + inside)
+
+
+def _polar_units(i: int, line: str, table: tuple[list[str], list[str]] | None) -> list[tuple[str, str]]:
+    """(текст предложения, контекст для квалификаторов): для таблицы — ячейка с подписью строки."""
+    if table is not None:
+        header, cells = table
+        if not cells:
+            return []
+        return [(_norm(f"{cells[0]}: {c}"), _norm(f"{cells[0]} {c}")) for c in cells[1:] if c]
+    return [(s, s) for s in _sentences(_norm(strip_ids(line)))]
+
+
+def _polar_records(doc: Document) -> list[_Polar]:
+    tables = _tables(doc)
+    fams = [(_rx(f.neg), _rx(f.pos)) for f in POLARITY_FAMILIES]
+    out: list[_Polar] = []
+    for i, line in _req_lines(doc):
+        line_topic = frozenset(content_stems(_norm(strip_ids(line))))
+        for sent, ctx in _polar_units(i, line, tables.get(i)):
+            low = sent.lower()
+            for k, (rneg, rpos) in enumerate(fams):
+                gate = POLARITY_FAMILIES[k].marker_is_topic
+                negs = [m for m in rneg.finditer(low) if m.end() > m.start()]
+                poss = [m for m in rpos.finditer(low) if m.end() > m.start() and not is_negated(low, m.start(), m.end())
+                        and not any(n.start() <= m.start() < n.end() for n in negs)]
+                if bool(negs) == bool(poss):
+                    continue     # ни одного маркера или исключение внутри одного предложения
+                side, ms = ("neg", negs) if negs else ("pos", poss)
+                marker = set()
+                if not gate:
+                    for m in ms:
+                        marker |= set(content_stems(sent[m.start():m.end()]))
+                focus: set[str] = set()
+                for m in ms:
+                    focus |= _focus(sent, m.start(), m.end(), keep_inside=gate)
+                out.append(_Polar(
+                    line=i, family=k, side=side, text=sent,
+                    topic=frozenset(set(content_stems(sent)) - marker), focus=frozenset(focus - marker),
+                    line_topic=line_topic - marker, quals=_qualifiers(ctx), chans=_channels(ctx), prods=_products(ctx),
+                    anchors=_anchors(sent),
+                ))
+    return out
+
+
+def scan_polarity_conflicts(doc: Document) -> list[Finding]:
+    """Одно действие с противоположной модальностью в разных строках: запрет vs разрешение, фиксировано vs
+    пересматривается, только с согласия vs автоматически, безотзывно vs можно отозвать, до завершения проверки
+    нельзя vs можно на время проверки. Тема совпадает, если общий объект маркера (focus) и ≥2 общих
+    содержательных основы. Не сравниваются строки про разные сегменты/продукты и строки с явным исключением."""
+    recs = _polar_records(doc)
+    out: list[Finding] = []
+    seen: set[tuple[int, int]] = set()
+    for a in recs:
+        if a.side != "neg":
+            continue
+        for b in recs:
+            if b.side != "pos" or b.family != a.family or b.line == a.line:
+                continue
+            key = (min(a.line, b.line), max(a.line, b.line))
+            if key in seen:
+                continue
+            # общее правило (без сегмента) против частного случая — противоречие; правила для двух разных
+            # сегментов/продуктов — нет
+            if (a.quals and b.quals and a.quals != b.quals) or (a.prods and b.prods and not (a.prods & b.prods)):
+                continue
+            if a.chans and b.chans and not (a.chans & b.chans):
+                continue
+            if _EXCEPTION.search(a.text.lower()) or _EXCEPTION.search(b.text.lower()):
+                continue
+            if _time_split(a.anchors, b.anchors):
+                continue
+            fam = POLARITY_FAMILIES[a.family]
+            if not _strong(a.focus & b.focus):
+                continue         # нет общего объекта у маркеров
+            if not (_shared_ok(set(a.topic), set(b.topic))
+                    or (not fam.sentence_topic and _shared_ok(set(a.line_topic), set(b.line_topic)))):
+                continue
+            seen.add(key)
+            shared =[w for w, s in _words(a.text) if s in _strong(a.focus & b.focus)]
+            topic = " ".join(dict.fromkeys(w.lower() for w in shared)) or fam.name
+            la, lb = key
+            cp = POLARITY_CONFLICT
+            out.append(Finding(
+                agent="consistency", category=Category.contradiction, severity=Severity(cp.severity),
+                title=f"Смысловое противоречие: {fam.name} — {topic}",
+                description=f"L{a.line}: {fam.neg_label}; L{b.line}: {fam.pos_label}. {cp.why}",
+                evidence=[_clip(doc.line(la)), _clip(doc.line(lb))], lines=[la, lb],
+                recommendation=cp.recommendation, question=cp.question.format(a=a.line, b=b.line, topic=topic),
+                control_id=cp.id, confidence=0.6,
             ))
     return out
 
