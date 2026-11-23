@@ -94,12 +94,19 @@ _NEG_AFTER = re.compile(
 )
 
 
+_INTERROGATIVE = re.compile(r"\b(?:не\s+[\w-]+|нет)\s+ли\b", re.IGNORECASE)
+
+
 def is_negated(line: str, start: int, end: int) -> bool:
     """Фрагмент [start, end) стоит под отрицанием в своей клаузе: «без 3-D Secure»,
-    «2FA не требуется», «3-D Secure отключается». Количественные «не менее/не более» — не отрицание."""
+    «2FA не требуется», «3-D Secure отключается». Количественные «не менее/не более» — не отрицание,
+    как и проверка условия «проверяется, не установил ли клиент самозапрет» / «нет ли просрочки»."""
     l = _norm(line)
     left, right = _clause_span(l, start, end)
-    return bool(_NEG_BEFORE.search(l[left:start]) or _NEG_AFTER.match(l[end:right]))
+    before = l[left:start]
+    if _INTERROGATIVE.search(before):
+        return False
+    return bool(_NEG_BEFORE.search(before) or _NEG_AFTER.match(l[end:right]))
 
 
 def _positive_hit(rx: re.Pattern, line: str) -> bool:

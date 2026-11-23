@@ -64,7 +64,13 @@ class Orchestrator:
 
     async def run(self, doc: Document, template: Document | None = None) -> Report:
         started = time.perf_counter()
-        ctx = Context(doc=doc, cfg=self.cfg, llm=LLMClient(self.cfg) if self.use_llm else None, template=template)
+        llm = LLMClient(self.cfg) if self.use_llm else None
+        if llm is not None and getattr(self.cfg, "privacy_enabled", False):
+            from privacy import PrivacyLLMClient   # маскирование ИИН/карт/телефонов перед облачным LLM
+
+            llm = PrivacyLLMClient(llm)
+            llm.prime(doc.text)
+        ctx = Context(doc=doc, cfg=self.cfg, llm=llm, template=template)
         ctx.started = started
         llm_mode = ctx.llm is not None
         reader_s, analysts, verifier_s, questions_s, scorer_s = build_pipeline()
@@ -128,6 +134,8 @@ class Orchestrator:
         if ctx.llm is not None:
             model = ctx.llm.active_model
             notes = []
+            if getattr(ctx.llm, "privacy_note", ""):
+                notes.append(ctx.llm.privacy_note)
             if ctx.llm.cache_hits:
                 notes.append(f"ответов из кэша: {ctx.llm.cache_hits}")
             if ctx.llm.switches:

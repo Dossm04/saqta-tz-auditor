@@ -93,6 +93,8 @@ with st.sidebar:
     st.divider()
     preset_name = st.selectbox("Провайдер LLM", list(presets.keys()))
     preset = presets[preset_name] or {}
+    if _g(preset, "note"):
+        st.caption(_g(preset, "note"))
     offline = bool(_g(preset, "offline", False)) or "офлайн" in preset_name.lower()
     base_url = st.text_input("Base URL", value=_g(preset, "base_url") or env_cfg.base_url or "", disabled=offline)
     api_key = st.text_input("API key", value="", type="password", disabled=offline,
