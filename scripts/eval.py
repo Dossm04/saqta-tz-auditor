@@ -102,9 +102,12 @@ def main() -> int:
     ap.add_argument("--min-recall", type=float, default=0.0)
     ap.add_argument("--max-fp", type=int, default=10 ** 6)
     ap.add_argument("--out", default=None, help="записать markdown-таблицу результатов")
+    ap.add_argument("--holdout", action="store_true",
+                    help="отложенная выборка eval/holdout_*.expected.json (ТЗ, на которых правила НЕ настраивались)")
     a = ap.parse_args()
     cfg = LLMConfig.from_env()
-    files = sorted((ROOT / "eval").glob("*.expected.json"))
+    files = sorted(f for f in (ROOT / "eval").glob("*.expected.json")
+                   if f.name.startswith("holdout_") == a.holdout)
     results = [evaluate(f, a.llm and cfg.enabled, cfg) for f in files]
 
     rows = ["| ТЗ | Режим | Найдено | Полнота | Ложные | Находок | Балл |", "|---|---|---|---|---|---|---|"]
