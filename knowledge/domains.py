@@ -29,20 +29,35 @@ DOMAIN_PATTERNS: dict[str, str] = {
     "crypto": r"крипт|цифров\w* актив|блокчейн|токен\w* (bitcoin|usdt)|stablecoin",
 }
 
+# Домен засчитывается, только если есть хотя бы один «сильный» признак: «график платежей»
+# или «платёжный терминал» в кредитном ТЗ ещё не делают его ТЗ на переводы.
+DOMAIN_STRONG: dict[str, str] = {
+    "transfers": r"перевод|p2p|получател|\bqr\b|kaspi|эквайринг|платежн\w* шлюз|оплат\w* (услуг|покуп|товар|по qr)",
+}
+
 
 OUT_OF_SCOPE = re.compile(
-    r"не входит|out of scope|вне (рамок|скоуп)|за рамками|следующ\w* (релиз|этап)|релиз\s*[2-9]|в будущ\w* (релиз|верси)|не реализу",
+    r"не вход(ит|ят)|out of scope|вне (рамок|скоуп)|за рамк\w* (проекта|mvp|релиза|скоупа|работ|тз|данного)|"
+    r"следующ\w* (релиз|этап)|релиз\w*\s*[2-9]|в будущ\w* (релиз|верси)|не реализу",
     re.IGNORECASE,
 )
 
 
+def in_scope_lines(text: str) -> list[str]:
+    """Строки, которые описывают скоуп проекта (без строк «не входит в MVP / релиз 2»)."""
+    return [l for l in text.splitlines() if not OUT_OF_SCOPE.search(l)]
+
+
 def detect_domains(text: str, min_hits: int = 2) -> list[str]:
     # строки «не входит в MVP / релиз 2» не делают домен применимым
-    lines = [l for l in text.splitlines() if not OUT_OF_SCOPE.search(l)]
-    t = "\n".join(lines).lower().replace("ё", "е")
+    t = "\n".join(in_scope_lines(text)).lower().replace("ё", "е")
     found = []
     for dom, pat in DOMAIN_PATTERNS.items():
         hits = len(re.findall(pat, t))
-        if hits >= min_hits:
-            found.append(dom)
+        if hits < min_hits:
+            continue
+        strong = DOMAIN_STRONG.get(dom)
+        if strong and not re.search(strong, t):
+            continue
+        found.append(dom)
     return found
