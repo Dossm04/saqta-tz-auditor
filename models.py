@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Any
 
@@ -89,6 +90,7 @@ class Finding(BaseModel):
     sources: list[str] = Field(default_factory=list)     # какие агенты нашли
     verified: bool | None = None
     verification_note: str | None = None
+    revision: int = 0                                    # 1 — исправлена агентом по замечанию Verifier
 
     @field_validator("severity", mode="before")
     @classmethod
@@ -157,6 +159,37 @@ class Question(BaseModel):
     answer_options: list[str] = Field(default_factory=list)  # варианты ответа для ускорения
     blocking: bool = False
     context: str = ""                                    # цитата из ТЗ, к которой относится вопрос
+    impact: str = ""                                     # что сломается, если ответа не будет
+    default_assumption: str = ""                         # что закладываем, если ответа нет до старта спринта
+    recommended_option: int | None = None                # индекс рекомендуемого варианта (с 0)
+    lint: list[str] = Field(default_factory=list)        # замечания линтера вопросов (пусто — прошёл чеклист)
+
+    @field_validator("recommended_option", mode="before")
+    @classmethod
+    def _norm_rec(cls, v: Any) -> Any:
+        if v is None or isinstance(v, bool):
+            return None
+        try:
+            v = int(str(v).strip())
+        except (TypeError, ValueError):
+            return None
+        return v if v >= 0 else None
+
+    @field_validator("answer_options", "related_findings", mode="before")
+    @classmethod
+    def _norm_str_list(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return [v] if v.strip() else []
+        return [str(x).strip() for x in (v or []) if str(x).strip()]
+
+    @field_validator("impact", "default_assumption", "why", "context", "addressee", mode="before")
+    @classmethod
+    def _norm_text(cls, v: Any) -> Any:
+        if v is None:
+            return ""
+        if isinstance(v, list):
+            return "; ".join(str(x) for x in v)
+        return str(v)
 
     @field_validator("priority", mode="before")
     @classmethod
@@ -211,9 +244,30 @@ class ControlCheck(BaseModel):
     @field_validator("status", mode="before")
     @classmethod
     def _norm_status(cls, v: Any) -> Any:
-        v = str(v or "missing").strip().lower()
-        return {"покрыто": "covered", "частично": "partial", "отсутствует": "missing",
-                "n/a": "not_applicable", "na": "not_applicable"}.get(v, v)
+        return normalize_control_status(v)
+
+
+CONTROL_STATUSES = ("covered", "partial", "missing", "not_applicable")
+_STATUS_ALIASES = {
+    "covered": "covered", "покрыто": "covered", "покрыт": "covered", "full": "covered", "fully_covered": "covered",
+    "fully": "covered", "описано": "covered", "есть": "covered", "ok": "covered", "implemented": "covered",
+    "partial": "partial", "partially": "partial", "partially_covered": "partial", "частично": "partial",
+    "частичное": "partial", "частичный": "partial", "неполно": "partial", "incomplete": "partial",
+    "missing": "missing", "отсутствует": "missing", "absent": "missing", "none": "missing", "нет": "missing",
+    "не_описано": "missing", "not_covered": "missing", "uncovered": "missing", "gap": "missing",
+    "not_applicable": "not_applicable", "n/a": "not_applicable", "na": "not_applicable", "н/п": "not_applicable",
+    "не_применимо": "not_applicable", "неприменимо": "not_applicable", "inapplicable": "not_applicable",
+    "irrelevant": "not_applicable",
+}
+
+
+def normalize_control_status(v: Any) -> str:
+    """Приводит статус контроля к одному из CONTROL_STATUSES; нераспознанное → 'unknown'
+    (агент сам решает, чем его заменить, — обычно статусом пред-проверки)."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return "missing"
+    key = re.sub(r"[\s\-]+", "_", str(v).strip().lower()).strip("_.")
+    return _STATUS_ALIASES.get(key, "unknown")
 
 
 class DimensionScore(BaseModel):
@@ -237,12 +291,75 @@ class AgentRun(BaseModel):
     tokens: int = 0
 
 
+class RejectedRecord(BaseModel):
+    """Находка, которую Verifier не пропустил в отчёт, — с человекочитаемой причиной."""
+    title: str
+    agent: str = ""
+    reason: str = ""
+    best_line: int | None = None       # ближайшая строка ТЗ, найденная при поиске цитаты
+    best_score: float = 0.0            # степень совпадения лучшей цитаты (0..1)
+    revision: int = 0                  # 1 — находка уже исправлялась агентом по замечанию Verifier
+    outcome: str = ""                  # чем закончилась обратная связь (critic loop)
+
+
+class MergeRecord(BaseModel):
+    kept_id: str = ""                  # ID итоговой находки (F-xx)
+    kept_title: str = ""
+    merged_title: str = ""
+    from_agent: str = ""
+    reason: str = ""
+
+
+class DowngradeRecord(BaseModel):
+    id: str = ""
+    title: str = ""
+    agent: str = ""
+    from_severity: str = ""
+    to_severity: str = ""
+    reason: str = ""
+    hit_lines: list[int] = Field(default_factory=list)
+
+
 class VerifierStats(BaseModel):
     input_findings: int = 0
     merged_duplicates: int = 0
     rejected_hallucinations: int = 0
     downgraded: int = 0
     output_findings: int = 0
+    rejected: list[RejectedRecord] = Field(default_factory=list)
+    merges: list[MergeRecord] = Field(default_factory=list)
+    downgrades: list[DowngradeRecord] = Field(default_factory=list)
+    # обратная связь Critic → аналитик (только LLM-режим, не более одного раунда)
+    revision_returned: int = 0
+    revision_restored: int = 0
+    revision_withdrawn: int = 0
+    restored: list[RejectedRecord] = Field(default_factory=list)
+
+
+class AgentMessage(BaseModel):
+    """Явное сообщение между агентами при передаче результата (для трассировки и UI)."""
+    sender: str
+    receiver: str
+    kind: str
+    count: int = 0
+    summary: str = ""
+    ts: float = 0.0                    # секунды от начала запуска
+
+
+class QuestionQuality(BaseModel):
+    """Измеримое качество уточняющих вопросов (чеклист линтера + покрытие находок)."""
+    total: int = 0
+    lint_passed: int = 0
+    with_options: float = 0.0          # доля вопросов с ≥2 содержательными вариантами
+    closed_p0p1: float = 0.0           # доля закрытых вопросов среди P0/P1
+    grounded: float = 0.0              # доля вопросов с цитатой ТЗ или привязкой к находке со строкой
+    with_default: float = 0.0          # доля вопросов с допущением по умолчанию
+    critical_covered: str = "0/0"
+    must_cover_covered: str = "0/0"    # критичные + противоречия + опасные требования + TBD
+    findings_covered: str = "0/0"
+    overflow: int = 0                  # вопросы сверх лимита встречи («Дополнительные вопросы»)
+    repaired: int = 0                  # вопросы, исправленные одним LLM-вызовом по замечаниям линтера
+    agenda_minutes: int = 0            # оценка длительности встречи (P0 — 5 мин, P1 — 3, P2 — 1)
 
 
 class Report(BaseModel):
@@ -266,6 +383,9 @@ class Report(BaseModel):
     line_count: int = 0
     template_check: list[dict] = Field(default_factory=list)   # соответствие шаблону ТЗ
     manual_review_hours: float = 0.0                            # оценка времени ручного ревью (см. scorer)
+    messages: list[AgentMessage] = Field(default_factory=list)  # сообщения агент → агент
+    question_quality: QuestionQuality = Field(default_factory=QuestionQuality)
+    extra_questions: list[Question] = Field(default_factory=list)  # вопросы сверх лимита одной встречи
 
     def severity_counts(self) -> dict[str, int]:
         out = {s.value: 0 for s in Severity}

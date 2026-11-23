@@ -77,7 +77,15 @@ def to_docx(r: Report) -> bytes:
     _table(doc, ["Измерение", "Балл", "Вес", "Комментарий"],
            [[d.name, d.score, f"{int(d.weight * 100)}%", d.comment] for d in r.dimensions])
 
-    doc.add_heading("Уточняющие вопросы к автору ТЗ", level=1)
+    doc.add_heading("Уточняющие вопросы к автору ТЗ (повестка встречи)", level=1)
+    qq = r.question_quality
+    if qq.total:
+        qp = doc.add_paragraph(
+            f"Качество вопросов: чеклист прошли {qq.lint_passed}/{qq.total}; с вариантами ответа {qq.with_options:.0%} "
+            f"(закрытых среди P0/P1 — {qq.closed_p0p1:.0%}); с привязкой к ТЗ {qq.grounded:.0%}; с допущением по умолчанию "
+            f"{qq.with_default:.0%}; критичные находки покрыты {qq.critical_covered}, обязательные — {qq.must_cover_covered}; "
+            f"встреча ≈ {qq.agenda_minutes} мин.")
+        qp.runs[0].font.size = Pt(9)
     for q in r.questions:
         h = doc.add_paragraph()
         h.add_run(f"{q.id} · {q.priority.label} · {q.addressee}{' · БЛОКЕР' if q.blocking else ''}").bold = True
@@ -87,9 +95,21 @@ def to_docx(r: Report) -> bytes:
             cp.runs[0].italic = True
         if q.why:
             doc.add_paragraph(f"Зачем: {q.why}")
-        for o in q.answer_options:
-            doc.add_paragraph(f"☐ {o}", style="List Bullet")
+        if q.impact:
+            doc.add_paragraph(f"Если не ответить: {q.impact}")
+        for i, o in enumerate(q.answer_options):
+            doc.add_paragraph(f"☐ {o}{'  ★ рекомендуем' if i == q.recommended_option else ''}", style="List Bullet")
+        if q.default_assumption:
+            dp_ = doc.add_paragraph()
+            dp_.add_run("Если ответа нет до старта спринта — закладываем: ").bold = True
+            dp_.add_run(q.default_assumption)
         doc.add_paragraph("Ответ: ________________________________________________")
+    if r.extra_questions:
+        doc.add_heading("Дополнительные вопросы (сверх лимита одной встречи)", level=2)
+        for q in r.extra_questions:
+            doc.add_paragraph(f"{q.id} [{q.priority.value}] ({q.addressee}) {q.question}"
+                              + (f" Варианты: {' / '.join(q.answer_options)}" if q.answer_options else ""),
+                              style="List Bullet")
 
     doc.add_heading("Находки", level=1)
     for f in r.findings:
@@ -135,6 +155,28 @@ def to_docx(r: Report) -> bytes:
     doc.add_paragraph(f"Verifier: на входе {v.input_findings} находок → {v.output_findings} после проверки "
                       f"(дублей объединено {v.merged_duplicates}, неподтверждённых отсечено {v.rejected_hallucinations}, "
                       f"понижено {v.downgraded}).")
+    if v.revision_returned:
+        doc.add_paragraph(f"Обратная связь Critic → аналитики: возвращено {v.revision_returned}, восстановлено после "
+                          f"исправления {v.revision_restored}, снято агентами {v.revision_withdrawn}.")
+    if v.rejected:
+        doc.add_heading("Verifier: отсечённые находки", level=2)
+        _table(doc, ["Находка", "Агент", "Причина", "Итог"], [[x.title, x.agent, x.reason, x.outcome] for x in v.rejected])
+    if v.restored:
+        doc.add_heading("Verifier: восстановлены после исправления агентом", level=2)
+        _table(doc, ["Находка", "Агент", "Исходная причина"], [[x.title, x.agent, x.reason] for x in v.restored])
+    if v.merges:
+        doc.add_heading("Verifier: склеенные дубли", level=2)
+        _table(doc, ["Итоговая находка", "Поглощена", "От агента", "Причина"],
+               [[f"{x.kept_id} {x.kept_title}", x.merged_title, x.from_agent, x.reason] for x in v.merges])
+    if v.downgrades:
+        doc.add_heading("Verifier: пониженная серьёзность", level=2)
+        _table(doc, ["Находка", "Агент", "Было → стало", "Причина", "Строки"],
+               [[f"{x.id} {x.title}", x.agent, f"{x.from_severity} → {x.to_severity}", x.reason,
+                 ", ".join(f"L{n}" for n in x.hit_lines[:4])] for x in v.downgrades])
+    if r.messages:
+        doc.add_heading("Сообщения между агентами", level=2)
+        _table(doc, ["t, с", "От", "Кому", "Тип", "Кол-во", "Содержание"],
+               [[m.ts, m.sender, m.receiver, m.kind, m.count, m.summary[:160]] for m in r.messages])
     dp = doc.add_paragraph(DISCLAIMER)
     dp.runs[0].italic = True
     dp.runs[0].font.size = Pt(8)

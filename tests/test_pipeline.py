@@ -101,6 +101,8 @@ class FakeLLM:
                     "findings": [{"category": "compliance", "severity": "critical", "title": "Хранение CVV",
                                   "evidence": ["сохраняет номер карты, срок действия и CVV"], "lines": [35],
                                   "regulation": "PCI DSS v4.0", "control_id": "AP-CVV-STORE", "confidence": 0.95}]}
+        elif "вернул тебе твои находки" in system:          # critic loop: «Марс» подтвердить нечем — снимаем
+            data = {"findings": [], "withdrawn": [1]}
         elif "агент **Question Generator**" in system:
             data = {"questions": [{"question": "Можно ли заменить хранение CVV токенизацией?", "priority": "P0",
                                    "related_findings": ["F-01", "F-99"], "answer_options": ["Да", "Нет"], "blocking": True}]}
@@ -125,4 +127,14 @@ def test_llm_pipeline_with_fake_model(monkeypatch):
     assert all("F-99" not in q.related_findings for q in r.questions)   # битая ссылка удалена
     crit = {f.id for f in r.findings if f.severity.value == "critical"}
     assert crit <= {fid for q in r.questions for fid in q.related_findings}
-    assert r.summary == "Резюме от LLM."
+    assert "Резюме от LLM." in r.summary and r.verdict in r.summary   # вердикт дословно
+    assert "P0" in r.summary and len(r.summary) <= 600
+    assert r.strengths and all("L" in s for s in r.strengths)          # «Есть интеграции» без строки отброшено
+    # critic loop: отклонённая находка возвращена автору и снята им
+    assert r.verifier.revision_returned >= 1 and r.verifier.revision_withdrawn >= 1
+    assert any(m.kind == "rejected" and m.receiver == "consistency" for m in r.messages)
+    assert any(t.agent == "critic" for t in r.trace)
+    # Reader: правила на стадии 1, LLM-обогащение — параллельно со стадией 2
+    readers = [t for t in r.trace if t.agent == "reader"]
+    assert [t.stage for t in readers] == [1, 2] and readers[1].mode == "llm"
+    assert r.document.title == "DemoBank Mobile"

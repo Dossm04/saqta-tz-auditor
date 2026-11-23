@@ -6,6 +6,7 @@ LLM только пишет текст резюме.
 from __future__ import annotations
 
 import math
+import re
 
 from pydantic import BaseModel
 
@@ -22,6 +23,8 @@ DIMENSIONS = [
     ("security", "Безопасность и комплаенс", 0.40, {Category.security, Category.compliance, Category.fintech}),
 ]
 PENALTY = {Severity.critical: 18.0, Severity.major: 8.0, Severity.minor: 3.0}
+SUMMARY_MAX = 600
+_LINE_REF = re.compile(r"\bL(\d{1,5})\b")
 DECAY = 70.0   # score = 100 * exp(-penalty / DECAY): одна критичная ≈ -23 балла, плавное насыщение
 
 
@@ -78,12 +81,11 @@ class ScorerAgent(Agent):
         cov = sum(c.status == "covered" for c in app)
         top = "; ".join(f.title for f in (crit + major)[:3])
         domains = ", ".join(DOMAIN_LABELS.get(d, d) for d in ctx.domains) or "не определены"
-        ex["summary"] = (
+        ex["summary"] = clamp_summary(
             f"ТЗ «{ctx.doc_model.title}» (области: {domains}) оценено в {ex['overall']}/100 — {ex['verdict'].lower()}. "
             f"Найдено {len(crit)} критичных и {len(major)} важных замечаний; покрыто {cov} из {len(app)} применимых "
             f"финтех/ИБ-контролей. Главные риски: {top or 'не выявлены'}. "
-            f"В первую очередь закройте вопросы приоритета P0 ({sum(q.priority.value == 'P0' for q in ctx.questions)} шт.)."
-        )
+            f"В первую очередь закройте вопросы приоритета P0 ({_p0(ctx)} шт.).")
         ex["strengths"] = self._strengths(ctx)
         return len(ex["dimensions"]), f"итог {ex['overall']}/100"
 
@@ -92,21 +94,76 @@ class ScorerAgent(Agent):
         ex = ctx.report_extra
         dims = "\n".join(f"- {d.name}: {d.score}/100 {d.comment}" for d in ex["dimensions"])
         covered = [c.title for c in ctx.controls if c.status == "covered"]
-        user = (f"## ТЗ\n{ctx.doc_model.title}: {ctx.doc_model.summary}\n\n## Оценки\nИтог: {ex['overall']}/100, вердикт: {ex['verdict']}\n{dims}\n\n"
-                f"## Покрытые контроли\n{'; '.join(covered) or '—'}\n\n## Находки\n{compact_findings(ctx.findings, 25)}")
+        covered_lines = [f"{c.title} ({', '.join('L' + str(n) for n in c.lines[:3])})"
+                         for c in ctx.controls if c.status == "covered" and c.lines]
+        p0 = _p0(ctx)
+        addressees = sorted({q.addressee for q in ctx.questions if q.priority.value == "P0"})
+        user = (f"## ТЗ\n{ctx.doc_model.title}: {ctx.doc_model.summary}\n\n## Оценки\nИтог: {ex['overall']}/100\n"
+                f"Вердикт (привести дословно): «{ex['verdict']}»\n{dims}\n\n"
+                f"## Вопросы к автору ТЗ\nP0 (блокеры): {p0}; адресаты P0: {', '.join(addressees) or '—'}\n\n"
+                f"## Покрытые контроли (со строками ТЗ)\n{'; '.join(covered_lines) or '; '.join(covered) or '—'}\n\n"
+                f"## Находки\n{compact_findings(ctx.findings, 25)}")
         out = await self.ask(ctx, load_prompt("scorer"), user, SummaryOut)
-        ex["summary"] = out.summary
-        ex["strengths"] = out.strengths[:4] or self._strengths(ctx)
+        ex["summary"] = finalize_summary(out.summary, ex["verdict"], p0)
+        ex["strengths"] = valid_strengths(out.strengths, ctx)[:4] or self._strengths(ctx)
         return len(ex["dimensions"]), f"итог {ex['overall']}/100"
 
     @staticmethod
     def _strengths(ctx: Context) -> list[str]:
+        """Сильные стороны правилами — каждая со ссылкой на строки ТЗ (L12), как и требуется от LLM."""
         out = []
-        covered = [c for c in ctx.controls if c.status == "covered"]
+        covered = [c for c in ctx.controls if c.status == "covered" and c.lines]
         if covered:
-            out.append("Описаны контроли: " + ", ".join(c.title for c in covered[:4]))
-        if len(ctx.doc_model.requirements) >= 10:
-            out.append(f"Выделено {len(ctx.doc_model.requirements)} требований — хорошая основа для трассировки")
-        if ctx.doc_model.integrations:
-            out.append("Перечислены интеграции: " + ", ".join(ctx.doc_model.integrations[:5]))
+            out.append("Описаны контроли: " + ", ".join(f"{c.title} (L{c.lines[0]})" for c in covered[:4]))
+        reqs = [r for r in ctx.doc_model.requirements if r.line]
+        if len(reqs) >= 10:
+            out.append(f"Выделено {len(ctx.doc_model.requirements)} требований (L{reqs[0].line}–L{reqs[-1].line}) — "
+                       f"хорошая основа для трассировки")
+        integ = [(name, ln) for name in ctx.doc_model.integrations[:5]
+                 if (ln := _first_line(ctx, name))]
+        if integ:
+            out.append("Перечислены интеграции: " + ", ".join(f"{n} (L{ln})" for n, ln in integ))
         return out or ["Документ структурирован по разделам"]
+
+
+def _first_line(ctx: Context, phrase: str) -> int | None:
+    word = re.split(r"[\s(]", phrase.strip(), maxsplit=1)[0]
+    if len(word) < 2:
+        return None
+    hits = ctx.doc.search(re.escape(word))
+    return hits[0] if hits else None
+
+
+def _p0(ctx: Context) -> int:
+    return sum(q.priority.value == "P0" for q in ctx.questions)
+
+
+def clamp_summary(text: str, limit: int = SUMMARY_MAX) -> str:
+    """Обрезает резюме до limit символов по границе предложения."""
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+    return cut[: end + 1] if end >= limit // 2 else cut[: limit - 1].rstrip() + "…"
+
+
+def finalize_summary(text: str, verdict: str, p0: int) -> str:
+    """Гарантии для резюме LLM: дословный вердикт, число вопросов P0, не длиннее SUMMARY_MAX."""
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if verdict and verdict.lower() not in text.lower():
+        text = f"Вердикт: «{verdict}». {text}"
+    tail = f" Закройте {p0} вопросов P0 до старта разработки." if p0 else ""
+    if p0 and not re.search(r"\bP0\b", text):
+        text = clamp_summary(text, SUMMARY_MAX - len(tail)) + tail
+    return clamp_summary(text)
+
+
+def valid_strengths(items: list[str], ctx: Context) -> list[str]:
+    """Оставляет только сильные стороны со ссылкой на существующую непустую строку ТЗ (L12)."""
+    out = []
+    for s in items:
+        refs = [int(n) for n in _LINE_REF.findall(s or "")]
+        if refs and all(ctx.doc.line(n).strip() for n in refs):
+            out.append(s.strip())
+    return out
