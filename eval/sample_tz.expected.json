@@ -1,0 +1,37 @@
+{
+  "sample": "samples/sample_tz.md",
+  "domain": "Мобильный банк: онбординг, карты, переводы",
+  "planted": [
+    {"id": "P1", "kind": "antipattern", "lines": [35], "control_id": "AP-CVV-STORE", "description": "Хранение CVV для повторных платежей"},
+    {"id": "P2", "kind": "antipattern", "lines": [60], "control_id": "AP-PAN-LOG", "description": "Номер карты пишется в лог"},
+    {"id": "P3", "kind": "antipattern", "lines": [29], "control_id": "AP-WEAK-CRYPTO", "description": "Пароли в MD5"},
+    {"id": "P4", "kind": "antipattern", "lines": [28], "control_id": "AP-PWD-PLAIN", "description": "Временный пароль отправляется на e-mail"},
+    {"id": "P5", "kind": "antipattern", "lines": [43], "control_id": "AP-NO-CONFIRM", "description": "Переводы до 50 000 ₸ без подтверждения"},
+    {"id": "P6", "kind": "antipattern", "lines": [50], "control_id": "AP-PD-SHARE", "description": "ПДн и ИИН передаются партнёрам без согласия"},
+    {"id": "P7", "kind": "antipattern", "lines": [21], "control_id": "AP-BIO-PHOTO", "description": "Фото селфи и документа хранятся бессрочно"},
+    {"id": "P8", "kind": "weakness", "lines": [26], "description": "4-значный ПИН без политики попыток"},
+    {"id": "P9", "kind": "contradiction", "lines": [42, 73], "description": "Суточный лимит 500 000 vs 1 000 000 ₸"},
+    {"id": "P10", "kind": "contradiction", "lines": [56, 72], "description": "Доступность 99.9% vs 99.5%"},
+    {"id": "P11", "kind": "contradiction", "lines": [43, 44], "description": "Без подтверждения vs каждая операция подтверждается"},
+    {"id": "P12", "kind": "tbd", "lines": [74], "description": "Резервное копирование — TBD"},
+    {"id": "P13", "kind": "vague", "lines": [55], "description": "«быстро», «интуитивно понятным»"},
+    {"id": "P14", "kind": "vague", "lines": [57], "description": "«большое количество пользователей»"},
+    {"id": "P15", "kind": "vague", "lines": [58], "description": "«надёжно и безопасно»"},
+    {"id": "P16", "kind": "vague", "lines": [46], "description": "«и т.д.»"},
+    {"id": "P17", "kind": "vague", "lines": [51], "description": "«при необходимости»"},
+    {"id": "P18", "kind": "vague", "lines": [40], "description": "«мгновенно»"},
+    {"id": "P19", "kind": "missing_control", "control_id": "PRIV-02", "description": "Нет хранения ПДн на территории РК"},
+    {"id": "P20", "kind": "missing_control", "control_id": "PRIV-01", "description": "Нет согласия на обработку ПДн"},
+    {"id": "P21", "kind": "missing_control", "control_id": "AML-02", "description": "Нет финмониторинга / АФМ"},
+    {"id": "P22", "kind": "missing_control", "control_id": "TX-IDEM-01", "description": "Нет идемпотентности"},
+    {"id": "P23", "kind": "missing_control", "control_id": "TX-FRAUD-01", "description": "Нет антифрода"},
+    {"id": "P24", "kind": "missing_control", "control_id": "SEC-AUTH-03", "description": "Нет тайм-аутов сессии и лимита попыток"},
+    {"id": "P25", "kind": "missing_section", "control_id": "STR-ACCEPT", "description": "Нет критериев приёмки"},
+    {"id": "P26", "kind": "missing_section", "control_id": "STR-SCOPE", "description": "Нет границ проекта"}
+  ],
+  "must_not_flag": [
+    {"lines": [5], "why": "Сведения о заказчике"},
+    {"lines": [61], "why": "Платформы указаны конкретно"},
+    {"lines": [78], "why": "Срок MVP указан"}
+  ]
+}

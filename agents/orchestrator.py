@@ -52,9 +52,9 @@ class Orchestrator:
         self.on_event("done", agent, run)
         return run
 
-    async def run(self, doc: Document) -> Report:
+    async def run(self, doc: Document, template: Document | None = None) -> Report:
         started = time.perf_counter()
-        ctx = Context(doc=doc, cfg=self.cfg, llm=LLMClient(self.cfg) if self.use_llm else None)
+        ctx = Context(doc=doc, cfg=self.cfg, llm=LLMClient(self.cfg) if self.use_llm else None, template=template)
         trace: list[AgentRun] = []
         for stage in build_pipeline():
             runs = await asyncio.gather(*(self._run_agent(a, ctx) for a in stage))
@@ -81,12 +81,24 @@ class Orchestrator:
             findings=ctx.findings, questions=ctx.questions, controls=ctx.controls, trace=trace, verifier=ctx.verifier,
             mode=mode, model=model,
             total_duration_s=round(time.perf_counter() - started, 2), total_tokens=sum(r.tokens for r in trace),
-            line_count=len(doc.lines),
+            line_count=len(doc.lines), template_check=ex.get("template", []),
+            manual_review_hours=manual_review_hours(doc, ctx),
         )
 
 
+def manual_review_hours(doc: Document, ctx: Context) -> float:
+    """Консервативная оценка ручного ревью тем же объёмом: чтение + разбор требований +
+    проверка ИБ/комплаенса + подготовка вопросов. Формула открыта, чтобы её можно было оспорить."""
+    minutes = (30                                    # первичное чтение и контекст
+               + 2.0 * len(ctx.doc_model.requirements)  # разбор каждого требования
+               + 0.4 * doc.non_empty_count             # сверка текста
+               + (45 if ctx.domains else 0)            # проверка ИБ и регуляторики специалистом
+               + 3.0 * len(ctx.questions))             # формулировка уточняющих вопросов
+    return round(minutes / 60 * 2) / 2               # с точностью до получаса
+
+
 def analyze(doc: Document, cfg: LLMConfig | None = None, use_llm: bool = True,
-            on_event: EventCallback | None = None) -> Report:
+            on_event: EventCallback | None = None, template: Document | None = None) -> Report:
     """Синхронная обёртка (для CLI и Streamlit)."""
     cfg = cfg or LLMConfig.from_env()
-    return asyncio.run(Orchestrator(cfg, use_llm=use_llm, on_event=on_event).run(doc))
+    return asyncio.run(Orchestrator(cfg, use_llm=use_llm, on_event=on_event).run(doc, template=template))

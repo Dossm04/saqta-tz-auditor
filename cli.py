@@ -20,10 +20,13 @@ def main() -> int:
     p.add_argument("--model", help="переопределить LLM_MODEL")
     p.add_argument("--out", help="сохранить Markdown-отчёт")
     p.add_argument("--json", help="сохранить JSON-отчёт")
+    p.add_argument("--docx", help="сохранить отчёт в Word (.docx)")
+    p.add_argument("--template", help="шаблон ТЗ (организаторов / банка): проверить наличие его разделов")
     a = p.parse_args()
 
     cfg = LLMConfig.from_env().with_overrides(model=a.model)
     doc = load_path(a.file)
+    template = load_path(a.template) if a.template else None
 
     def on_event(kind, agent, run):
         if kind == "done":
@@ -33,10 +36,14 @@ def main() -> int:
     if use_llm and not cfg.enabled:
         print("LLM_API_KEY не задан — работаю в офлайн-режиме (правила).")
     print(f"Анализ «{doc.name}» ({len(doc.lines)} строк)…")
-    r = analyze(doc, cfg, use_llm=use_llm, on_event=on_event)
+    r = analyze(doc, cfg, use_llm=use_llm, on_event=on_event, template=template)
     sc = r.severity_counts()
     cov, part, total = r.control_coverage()
     print(f"\nИТОГ: {r.overall_score}/100 — {r.verdict}")
+    print(f"Время: {r.total_duration_s} с вместо ≈{r.manual_review_hours} ч ручного ревью")
+    if r.template_check:
+        ok = sum(t["present"] for t in r.template_check)
+        print(f"Шаблон: {ok}/{len(r.template_check)} разделов на месте")
     print(f"Находки: 🔴 {sc['critical']}  🟠 {sc['major']}  🟡 {sc['minor']} | вопросов: {len(r.questions)} | "
           f"контроли: {cov}+{part}½/{total}")
     for d in r.dimensions:
@@ -48,6 +55,11 @@ def main() -> int:
     if a.json:
         Path(a.json).write_text(to_json(r), encoding="utf-8")
         print(f"JSON: {a.json}")
+    if a.docx:
+        from report_docx import to_docx
+
+        Path(a.docx).write_bytes(to_docx(r))
+        print(f"Word: {a.docx}")
     return 0
 
 

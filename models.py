@@ -264,6 +264,8 @@ class Report(BaseModel):
     total_duration_s: float = 0.0
     total_tokens: int = 0
     line_count: int = 0
+    template_check: list[dict] = Field(default_factory=list)   # соответствие шаблону ТЗ
+    manual_review_hours: float = 0.0                            # оценка времени ручного ревью (см. scorer)
 
     def severity_counts(self) -> dict[str, int]:
         out = {s.value: 0 for s in Severity}

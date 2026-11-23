@@ -14,7 +14,8 @@ def to_markdown(r: Report) -> str:
     out = [
         f"# Отчёт о качестве ТЗ: {r.document.title}",
         "",
-        f"**Файл:** {r.document_name} · **Режим:** {r.mode} ({r.model}) · **Время:** {r.total_duration_s} с",
+        f"**Файл:** {r.document_name} · **Режим:** {r.mode} ({r.model}) · **Время:** {r.total_duration_s} с "
+        f"(ручное ревью ≈ {r.manual_review_hours} ч)",
         "",
         f"## Итог: {r.overall_score}/100 — {r.verdict}",
         "",
@@ -72,6 +73,12 @@ def to_markdown(r: Report) -> str:
             continue
         out.append(f"| {c.control_id} | {c.area} | {c.title} | {_STATUS.get(c.status, c.status)} | "
                    f"{', '.join('L' + str(n) for n in c.lines[:4])} |")
+
+    if r.template_check:
+        ok = sum(t["present"] for t in r.template_check)
+        out += ["", f"## Соответствие шаблону ТЗ ({ok}/{len(r.template_check)})", "",
+                "| Раздел шаблона | В ТЗ | Найденный заголовок |", "|---|---|---|"]
+        out += [f"| {t['title']} | {'✅' if t['present'] else '❌'} | {t.get('matched') or ''} |" for t in r.template_check]
 
     v = r.verifier
     out += ["", "## Трассировка агентов", "", "| Стадия | Агент | Режим | Время, с | Результат | Примечание |", "|---|---|---|---|---|---|"]

@@ -188,6 +188,7 @@ class Context:
     doc: Document
     cfg: LLMConfig
     llm: LLMClient | None = None
+    template: Document | None = None                             # шаблон ТЗ (организаторов / банка)
     doc_model: DocumentModel = field(default_factory=DocumentModel)
     domains: list[str] = field(default_factory=list)
     findings_by_agent: dict[str, list[Finding]] = field(default_factory=dict)

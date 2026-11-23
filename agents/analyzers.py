@@ -8,6 +8,7 @@ from pydantic import BaseModel, ValidationError
 from agents import rules
 from agents.base import Agent, Context, doc_model_brief, load_prompt
 from knowledge.fintech_controls import CONTROLS_BY_ID, applicable_controls
+from knowledge.template import template_findings
 from models import ControlCheck, Finding
 
 
@@ -48,15 +49,28 @@ class CompletenessAgent(Agent):
     role = "Пропущенные разделы и требования: цели, роли, NFR, сценарии ошибок, критерии приёмки"
     stage = 2
 
+    def _template(self, ctx: Context) -> tuple[list[Finding], str]:
+        """Проверка по шаблону: детерминированная, добавляется в обоих режимах."""
+        if ctx.template is None:
+            return [], ""
+        findings, matches = template_findings(ctx.doc, ctx.template)
+        ctx.report_extra["template"] = [
+            {"id": m.section.id, "title": m.section.title, "present": m.present, "matched": m.matched,
+             "line": m.line, "score": m.score} for m in matches]
+        ok = sum(m.present for m in matches)
+        return findings, f"; шаблон: {ok}/{len(matches)} разделов"
+
     def run_rules(self, ctx: Context) -> tuple[int, str]:
         checks = rules.scan_sections(ctx.doc)
-        findings = rules.section_findings(ctx.doc, checks)
+        tpl, tpl_note = self._template(ctx)
+        findings = rules.section_findings(ctx.doc, checks) + tpl
         ctx.findings_by_agent[self.name] = findings
         present = sum(1 for c in checks if c.present)
-        return len(findings), f"разделов найдено {present}/{len(checks)}"
+        return len(findings), f"разделов найдено {present}/{len(checks)}{tpl_note}"
 
     async def run_llm(self, ctx: Context) -> tuple[int, str]:
         checks = rules.scan_sections(ctx.doc)
+        tpl, tpl_note = self._template(ctx)
         checklist = "\n".join(
             f"- {c.section.id} «{c.section.title}» — пред-проверка: "
             f"{'present' if c.present else 'missing'}"
@@ -64,11 +78,18 @@ class CompletenessAgent(Agent):
             f"{' [нужны числовые значения]' if c.section.needs_number else ''}"
             for c in checks
         )
+        extra = f"## Чеклист разделов и пред-проверка\n{checklist}"
+        if ctx.template is not None:
+            tpl_rows = "\n".join(f"- {t['id']} «{t['title']}»: {'есть' if t['present'] else 'НЕТ'}"
+                                 for t in ctx.report_extra.get("template", []))
+            extra += (f"\n\n## Обязательный шаблон ТЗ (разделы и наличие в документе)\n{tpl_rows}\n"
+                      "Отсутствующие разделы шаблона уже учтены отдельно — не дублируй их; оцени, достаточно ли "
+                      "содержательно заполнены присутствующие разделы шаблона.")
         system = load_prompt("completeness", COMMON=load_prompt("_common"))
-        out = await self.ask(ctx, system, _user_message(ctx, f"## Чеклист разделов и пред-проверка\n{checklist}"), RawFindings)
-        findings = parse_findings(out.findings, self.name)
+        out = await self.ask(ctx, system, _user_message(ctx, extra), RawFindings)
+        findings = parse_findings(out.findings, self.name) + tpl
         ctx.findings_by_agent[self.name] = findings
-        return len(findings), f"пред-проверка: разделов {sum(c.present for c in checks)}/{len(checks)}"
+        return len(findings), f"пред-проверка: разделов {sum(c.present for c in checks)}/{len(checks)}{tpl_note}"
 
 
 # ── Consistency ───────────────────────────────────────────────────────────────

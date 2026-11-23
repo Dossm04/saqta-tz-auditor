@@ -101,6 +101,22 @@ else:
     if txt.strip():
         doc = load_text(txt)
 
+with st.expander("📐 Шаблон ТЗ (необязательно): проверить, все ли его разделы на месте"):
+    tpl_src = st.radio("Шаблон", ["Без шаблона", "Пример шаблона банка", "Загрузить шаблон организаторов"],
+                       horizontal=True, label_visibility="collapsed")
+    template: Document | None = None
+    if tpl_src == "Пример шаблона банка":
+        template = load_path(ROOT / "samples" / "template_example.md")
+    elif tpl_src == "Загрузить шаблон организаторов":
+        tup = st.file_uploader("Шаблон в .md, .txt, .docx или .pdf", type=["md", "txt", "docx", "pdf"], key="tpl")
+        if tup is not None:
+            template = load_bytes(tup.getvalue(), tup.name)
+    if template is not None:
+        from knowledge.template import sections_from_template
+
+        secs = sections_from_template(template)
+        st.caption(f"Разделов в шаблоне: {len(secs)} — " + "; ".join(s.title for s in secs[:12]))
+
 ss = st.session_state
 ss.setdefault("history", [])
 
@@ -137,15 +153,16 @@ def run(doc: Document, label: str) -> None:
                 f'<div class="s"><b>{r.produced}</b> · {r.mode} · {r.duration_s} с<br>{html.escape(r.note[:140])}</div></div>',
                 unsafe_allow_html=True)
 
-    report = analyze(doc, cfg, use_llm=use_llm, on_event=on_event)
+    report = analyze(doc, cfg, use_llm=use_llm, on_event=on_event, template=ss.get("template"))
     ss.report, ss.doc = report, doc
     ss.history.append((label, report.overall_score, report.severity_counts()["critical"]))
     ss.answers = {}
     ss.run_id = ss.get("run_id", 0) + 1
 
 
-c1, c2 = st.columns([1, 4])
+c1, c2 = st.columns([1.3, 4])
 if c1.button("🚀 Анализировать", type="primary", disabled=doc is None, width="stretch"):
+    ss.template = template
     run(doc, doc.name)
 
 report: Report | None = ss.get("report")
@@ -169,7 +186,11 @@ with left:
     st.markdown(f'<div class="score" style="color:{_color(report.overall_score)}">{report.overall_score}<span style="font-size:1.2rem;opacity:.6">/100</span></div>'
                 f'<div style="font-weight:700;color:{_color(report.overall_score)}">{report.verdict}</div>{delta}',
                 unsafe_allow_html=True)
-    st.caption(f"{report.document.title} · {report.mode} · {report.total_duration_s} с"
+    st.markdown(f'<div style="margin-top:.4rem;font-size:.92rem">⏱ <b>{report.total_duration_s} с</b> вместо '
+                f'<b>≈{report.manual_review_hours} ч</b> ручного ревью</div>', unsafe_allow_html=True,
+                help="Оценка ручного ревью: 30 мин чтение + 2 мин на требование + 0,4 мин на строку + "
+                     "45 мин проверка ИБ/регуляторики + 3 мин на вопрос")
+    st.caption(f"{report.document.title} · {report.mode} · {report.model}"
                + (f" · {report.total_tokens} ток." if report.total_tokens else ""))
 with mid:
     st.markdown(report.summary)
@@ -283,6 +304,12 @@ with tabs[2]:
             for c in report.controls if show_na or c.status != "not_applicable"]
     st.dataframe(rows, width="stretch", hide_index=True,
                  column_config={"Норма": st.column_config.TextColumn(width="large")})
+    if report.template_check:
+        ok = sum(t["present"] for t in report.template_check)
+        st.markdown(f"**Соответствие шаблону ТЗ: {ok}/{len(report.template_check)} разделов**")
+        st.dataframe([{"Раздел шаблона": t["title"], "В ТЗ": "✅" if t["present"] else "❌",
+                       "Найденный заголовок": t.get("matched") or "", "Сходство": f"{t['score']:.0%}"}
+                      for t in report.template_check], width="stretch", hide_index=True)
 
 # ── Документ с разметкой ─────────────────────────────────────────────────────
 with tabs[3]:
@@ -337,7 +364,11 @@ digraph G {
 # ── Экспорт ───────────────────────────────────────────────────────────────────
 with tabs[5]:
     stem = Path(report.document_name).stem
-    e1, e2, e3 = st.columns(3)
+    from report_docx import to_docx
+
+    e0, e1, e2, e3 = st.columns(4)
+    e0.download_button("📄 Отчёт (Word)", to_docx(report), file_name=f"{stem}_review.docx", width="stretch",
+                       mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", type="primary")
     e1.download_button("📝 Отчёт (Markdown)", to_markdown(report), file_name=f"{stem}_review.md", width="stretch")
     e2.download_button("🧾 Отчёт (JSON)", to_json(report), file_name=f"{stem}_review.json", width="stretch")
     q_md = "\n\n".join(f"{q.id} [{q.priority.value}] ({q.addressee}) {q.question}" +
