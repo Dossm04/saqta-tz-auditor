@@ -10,21 +10,43 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 
 from knowledge.antipatterns import ANTIPATTERNS
+from knowledge.domains import OUT_OF_SCOPE
 from knowledge.fintech_controls import CONTROLS, Control
-from knowledge.language import METRIC_PATTERNS, METRIC_QUALIFIERS, VAGUE_TERMS
+from knowledge.language import CONFLICT_PAIRS, METRIC_PATTERNS, METRIC_QUALIFIERS, SEGMENTS, VAGUE_TERMS
 from knowledge.tz_structure import SECTIONS, Section
 from models import Category, ControlCheck, Finding, Severity
 from parsing import Document
 
 _DIGIT = re.compile(r"\d")
-_HEADING = re.compile(r"^\s*(#{1,6}\s+|\d+(\.\d+)*\.?\s+[А-ЯA-ZЁ])")
-_LEAD_ID = re.compile(r"^\s*(?:[-*•|]\s*)?(?:#+\s*)?(?:(?:[A-ZА-Я]{1,5}[-.]?)?\d+(?:\.\d+)*\.?\)?\s+)?", re.I)
+_MD_HEADING = re.compile(r"^\s*#{1,6}\s+")
+_NUM_TITLE = re.compile(r"^\s*\d+(?:\.\d+)*\.?\s+[А-ЯA-ZЁ]")
+# глагол/модальность → это требование, а не заголовок раздела
+_REQ_VERB = re.compile(r"\b(долж|необходим|обязан|требуется|может|могут|нужно)\w*|\w{3,}(ет|ит|ут|ют|ят|ат)(ся)?\b",
+                       re.IGNORECASE)
+# Нумерация/ID в начале строки. Голое число снимается только с точкой/скобкой («1.», «2)»)
+# или многоуровневое перед заглавной («3.2.1 Текст»): «5 минут неактивности» — это значение, а не номер.
+_LEAD_ID = re.compile(
+    r"^\s*(?:[-*•|]\s*)?(?:#+\s*)?"
+    r"(?:(?:[A-ZА-ЯЁ]{1,6}[-.]?\d+(?:\.\d+)*\.?\)?|\d+(?:\.\d+)*[.)]|\d+(?:\.\d+)+(?=\s+[А-ЯЁA-Z]))\s+)?"
+)
 
 
 def strip_ids(line: str) -> str:
-    """Убирает нумерацию и ID требования в начале строки (FR-01., 3.2.1, - ), чтобы
-    цифры из ID не принимались за метрику."""
+    """Убирает нумерацию и ID требования в начале строки (FR-01., 3.2.1, 1), - ), чтобы
+    цифры из ID не принимались за метрику. Ведущие количества («5 минут») сохраняются."""
     return _LEAD_ID.sub("", line, count=1)
+
+
+def _is_heading(line: str) -> bool:
+    """Заголовок раздела: markdown-заголовок или короткая нумерованная строка без глагола и точки в конце."""
+    if _MD_HEADING.match(line):
+        return True
+    s = line.strip()
+    if not _NUM_TITLE.match(s) or len(s) >= 60 or s.endswith((".", ";", "!", "?", ":")):
+        return False
+    body = strip_ids(s)
+    return len(body.split()) <= 7 and not _REQ_VERB.search(body)
+
 
 DOWNGRADE = {"critical": "major", "major": "minor", "minor": "minor"}
 
@@ -33,9 +55,57 @@ def _rx(p: str) -> re.Pattern:
     return re.compile(p, re.IGNORECASE)
 
 
+def _norm(line: str) -> str:
+    return line.replace("ё", "е").replace("Ё", "Е")
+
+
+def _out_of_scope(line: str) -> bool:
+    return bool(OUT_OF_SCOPE.search(_norm(line)))
+
+
 def _clip(s: str, n: int = 200) -> str:
     s = s.strip().lstrip("#-*• ").strip()
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+# ── Клаузы и отрицание ────────────────────────────────────────────────────────
+
+_CLAUSE_STOP = re.compile(r"[;,():—]|\.\s")
+
+
+def _clause_span(l: str, start: int, end: int) -> tuple[int, int]:
+    """Границы клаузы (между , ; : ( ) — и концом предложения), в которой стоит фрагмент [start, end)."""
+    left = 0
+    for m in _CLAUSE_STOP.finditer(l, 0, start):
+        left = m.end()
+    m = _CLAUSE_STOP.search(l, end)
+    return left, (m.start() if m else len(l))
+
+
+_NEG_BEFORE = re.compile(
+    r"(?:\b(?:без|нет|ни)\b|\bне\b(?!\s+(?:менее|более|позднее|позже|ранее|реже|чаще|выше|ниже|больше|меньше|дольше|только|превыша\w*))"
+    r"|\bотключ\w*|\bотказ\w* от)(?:\s+[\w/-]+){0,3}\s*$",
+    re.IGNORECASE,
+)
+_NEG_AFTER = re.compile(
+    r"^[\w/-]*(?:\s+(?!не\b)[\w/-]+){0,3}?\s+(?:не\s+(?:требу|применя|использ|провод|проход|запрашива|предусм|поддержива|проверя|выполня"
+    r"|осуществля|реализу|включа|нужн)\w*|отключа\w*|отсутству\w*)",
+    re.IGNORECASE,
+)
+
+
+def is_negated(line: str, start: int, end: int) -> bool:
+    """Фрагмент [start, end) стоит под отрицанием в своей клаузе: «без 3-D Secure»,
+    «2FA не требуется», «3-D Secure отключается». Количественные «не менее/не более» — не отрицание."""
+    l = _norm(line)
+    left, right = _clause_span(l, start, end)
+    return bool(_NEG_BEFORE.search(l[left:start]) or _NEG_AFTER.match(l[end:right]))
+
+
+def _positive_hit(rx: re.Pattern, line: str) -> bool:
+    """В строке есть совпадение, которое не стоит под отрицанием."""
+    l = _norm(line)
+    return any(not is_negated(l, m.start(), m.end()) for m in rx.finditer(l) if m.end() > m.start())
 
 
 # ── Разделы ТЗ ────────────────────────────────────────────────────────────────
@@ -91,9 +161,13 @@ def section_findings(doc: Document, checks: list[SectionCheck]) -> list[Finding]
 # ── Финтех/ИБ-контроли ────────────────────────────────────────────────────────
 
 def check_control(doc: Document, c: Control) -> ControlCheck:
+    """Покрытие контроля по признакам. Не засчитываются: строки вне скоупа («не входит в MVP»)
+    и совпадения под отрицанием («без 3-D Secure», «2FA не требуется»)."""
     hit_patterns, lines = 0, set()
+    scoped = [(i, line) for i, line in enumerate(doc.lines, start=1) if line.strip() and not _out_of_scope(line)]
     for p in c.patterns:
-        found = doc.search(p)
+        rx = _rx(p)
+        found = [i for i, line in scoped if _positive_hit(rx, line)]
         if found:
             hit_patterns += 1
             lines.update(found)
@@ -147,11 +221,16 @@ def control_finding(c: Control, check: ControlCheck, agent: str = "fintech_secur
 # ── Опасные требования ────────────────────────────────────────────────────────
 
 def scan_antipatterns(doc: Document, agent: str = "fintech_security") -> list[Finding]:
+    scoped = [(i, line, _norm(line)) for i, line in enumerate(doc.lines, start=1)
+              if line.strip() and not _out_of_scope(line)]
     out = []
     for ap in ANTIPATTERNS:
         rx, unless = _rx(ap.pattern), (_rx(ap.unless) if ap.unless else None)
-        for i, line in enumerate(doc.lines, start=1):
-            l = line.replace("ё", "е").replace("Ё", "Е")
+        absent = getattr(ap, "requires_absent", None)
+        # условие на уровне документа: например, «короткий ПИН» опасен, только если нигде нет политики попыток
+        if absent and any(_rx(absent).search(l) for _, _, l in scoped):
+            continue
+        for i, line, l in scoped:
             if rx.search(l) and not (unless and unless.search(l)):
                 out.append(Finding(
                     agent=agent, category=Category(ap.category), severity=Severity(ap.severity),
@@ -172,13 +251,15 @@ def scan_vague(doc: Document) -> list[Finding]:
     out = []
     compiled = [(_rx(v.pattern), v) for v in VAGUE_TERMS]
     for i, line in enumerate(doc.lines, start=1):
-        if not line.strip() or _HEADING.match(line) and len(line) < 60:
+        if not line.strip() or _is_heading(line):
             continue
-        l = line.replace("ё", "е").replace("Ё", "Е")
+        l = _norm(line)
+        if OUT_OF_SCOPE.search(l):
+            continue  # «Мгновенные переводы не входят в рамки проекта» — не требование
         body = strip_ids(l)
         hits = []
         for rx, v in compiled:
-            m = rx.search(l)
+            m = rx.search(body)
             if not m:
                 continue
             if v.kind == "metric" and _DIGIT.search(body):
@@ -226,53 +307,133 @@ def _unit_scale(u: str | None) -> float:
         return 0.001
     if u.startswith("мин"):
         return 60.0
+    if u.startswith("час"):
+        return 3600.0
     return 1.0
 
 
-def scan_metric_conflicts(doc: Document) -> list[Finding]:
-    """Ищет разные значения одной и той же метрики в разных местах ТЗ."""
+def _segment(text: str) -> str:
+    """Сегмент клиентов/операций (уровень идентификации, межбанк, новое устройство…)."""
+    return next((name for name, p in SEGMENTS.items() if re.search(p, text)), "")
+
+
+def _segments(text: str) -> set[str]:
+    return {name for name, p in SEGMENTS.items() if re.search(p, text)}
+
+
+def _fmt(v: float) -> str:
+    return f"{v:,.0f}".replace(",", " ") if v >= 10000 and v == int(v) else "%g" % v
+
+
+def scan_metric_conflicts(doc: Document, semantic: bool = True) -> list[Finding]:
+    """Ищет разные значения одной и той же метрики в разных местах ТЗ.
+
+    Значения сравниваются только внутри одного уточнителя (период лимита, рабочие/календарные дни)
+    и одного сегмента (упрощённая/полная идентификация и т.п.). При semantic=True к результату
+    добавляются смысловые противоречия (scan_semantic_conflicts) — так их получает и вызывающий код,
+    который знает только про scan_metric_conflicts."""
     out = []
+    lines = [(i, strip_ids(line).replace("ё", "е").lower()) for i, line in enumerate(doc.lines, start=1)
+             if line.strip() and not _out_of_scope(line)]
     for metric, pattern in METRIC_PATTERNS.items():
         rx = _rx(pattern)
-        values: dict[str, dict[float, list[int]]] = {}
-        for i, line in enumerate(doc.lines, start=1):
-            l = strip_ids(line).replace("ё", "е").lower()
+        values: dict[tuple[str, str], dict[float, list[int]]] = {}
+        for i, l in lines:
             for m in rx.finditer(l):
                 gd = m.groupdict()
-                raw = gd.get("v") or gd.get("v2")
+                vkey = "v" if gd.get("v") else "v2"
+                raw = gd.get(vkey)
                 if not raw:
                     continue
                 try:
-                    val = _num(raw) * _unit_scale(gd.get("u"))
+                    val = _num(raw) * _unit_scale(gd.get("u") or gd.get("u2"))
                 except ValueError:
                     continue
+                # уточнитель ищем только в клаузе (между , и ;), где стоит значение
+                vs, ve = m.span(vkey)
+                left = max(l.rfind(",", 0, vs), l.rfind(";", 0, vs)) + 1
+                rights = [p for p in (l.find(",", ve), l.find(";", ve)) if p != -1]
+                clause = l[left: min(rights) if rights else len(l)]
                 q = ""
                 if metric in METRIC_QUALIFIERS:
                     quals, default = METRIC_QUALIFIERS[metric]
-                    # ищем уточнитель только в клаузе (между , и ;), где стоит значение
-                    vs, ve = m.span("v" if gd.get("v") else "v2")
-                    left = max(l.rfind(",", 0, vs), l.rfind(";", 0, vs)) + 1
-                    rights = [p for p in (l.find(",", ve), l.find(";", ve)) if p != -1]
-                    clause = l[left: min(rights) if rights else len(l)]
-                    q = next((name for name, p in quals.items() if re.search(p, clause)), default)
+                    q = next((name for name, p in quals.items() if re.search(p, clause)), default) or ""
                     if q == "skip":
                         continue
-                values.setdefault(q, {}).setdefault(val, []).append(i)
-        for q, vals in values.items():
+                seg = _segment(clause) or _segment(l)
+                bucket = values.setdefault((q, seg), {}).setdefault(val, [])
+                if i not in bucket:
+                    bucket.append(i)
+        for (q, seg), vals in values.items():
             if len(vals) < 2:
                 continue
-            lines = sorted({n for ns in vals.values() for n in ns})
-            label = metric + (f" ({q})" if q else "")
-            shown = ", ".join(f"{('%g' % v)} (L{', L'.join(map(str, ns[:2]))})" for v, ns in vals.items())
+            lines_ = sorted({n for ns in vals.values() for n in ns})
+            if len(lines_) < 2:
+                continue  # разные значения в одной строке — это обычно диапазон, а не противоречие
+            quals = "; ".join(x for x in (q, seg) if x)
+            label = metric + (f" ({quals})" if quals else "")
+            shown = ", ".join(f"{_fmt(v)} (L{', L'.join(map(str, ns[:2]))})" for v, ns in vals.items())
+            weak = q == "без уточнения периода"
             out.append(Finding(
                 agent="consistency", category=Category.contradiction,
-                severity=Severity.major if q != "без уточнения периода" else Severity.minor,
+                severity=Severity.minor if weak else Severity.major,
                 title=f"Противоречивые значения: {label}",
                 description=f"Для метрики «{label}» в документе указаны разные значения: {shown}.",
-                evidence=[_clip(doc.line(n)) for n in lines[:3]], lines=lines[:6],
+                evidence=[_clip(doc.line(n)) for n in lines_[:3]], lines=lines_[:6],
                 recommendation="Оставить одно значение в одном месте ТЗ (single source of truth) и сослаться на него из остальных разделов.",
                 question=f"Какое значение метрики «{label}» верное: {shown}?",
-                confidence=0.7 if q != "без уточнения периода" else 0.5,
+                confidence=0.5 if weak else 0.7,
+            ))
+    if semantic:
+        out += scan_semantic_conflicts(doc)
+    return out
+
+
+def scan_semantic_conflicts(doc: Document) -> list[Finding]:
+    """Смысловые противоречия без чисел: «без комиссии» vs «комиссия 1%» для одной темы,
+    исключение «без подтверждения» vs правило «каждая операция подтверждается», нетто vs брутто,
+    «только полностью идентифицированным» vs разрешение при упрощённой идентификации, ПДн в РК vs за рубежом."""
+    scoped = [(i, line, _norm(line).lower()) for i, line in enumerate(doc.lines, start=1)
+              if line.strip() and not _out_of_scope(line) and not _is_heading(line)]
+    out: list[Finding] = []
+    for cp in CONFLICT_PAIRS:
+        ra, rb = _rx(cp.side_a), _rx(cp.side_b)
+        ua = _rx(cp.unless_a) if cp.unless_a else None
+        ub = _rx(cp.unless_b) if cp.unless_b else None
+        side_a = [(i, line, l) for i, line, l in scoped if ra.search(l) and not (ua and ua.search(l))]
+        side_b = [(i, line, l) for i, line, l in scoped if rb.search(l) and not (ub and ub.search(l))]
+        if not side_a or not side_b:
+            continue
+        topics = cp.topics or (("", ""),)
+        for topic, tp in topics:
+            ta = [x for x in side_a if not tp or re.search(tp, x[2])]
+            tb = [x for x in side_b if not tp or re.search(tp, x[2])]
+            pair = None
+            for a in ta:
+                for b in tb:
+                    if a[0] == b[0]:
+                        continue
+                    if cp.check_segments:
+                        sa, sb = _segments(a[2]), _segments(b[2])
+                        if sa and sb and not (sa & sb):
+                            continue  # про разные сегменты клиентов — не противоречие
+                    pair = (a, b)
+                    break
+                if pair:
+                    break
+            if not pair:
+                continue
+            (la, line_a, _), (lb, line_b, _) = pair
+            fmt = {"a": la, "b": lb, "topic": topic or "операции"}
+            title = f"Смысловое противоречие: {cp.title}" + (f" — {topic}" if topic else "")
+            out.append(Finding(
+                agent="consistency", category=Category.contradiction, severity=Severity(cp.severity),
+                title=title,
+                description=f"L{la}: {cp.label_a}; L{lb}: {cp.label_b}. {cp.why}",
+                evidence=[_clip(line_a), _clip(line_b)], lines=sorted({la, lb}),
+                recommendation=cp.recommendation,
+                question=cp.question.format(**fmt),
+                control_id=cp.id, confidence=0.7,
             ))
     return out
 
