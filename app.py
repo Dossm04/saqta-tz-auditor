@@ -327,9 +327,19 @@ with tabs[0]:
     k3.metric("Время встречи", f"≈{total_min} мин", help="P0 — 5 мин, P1 — 3 мин, P2 — 1 мин")
     k4.metric("Отвечено", f"{answered}/{len(qs)}")
     qm = _g(report, "question_quality")
-    if qm:
-        st.caption("Качество вопросов: " + " · ".join(f"{k}: {v:.0%}" if isinstance(v, float) else f"{k}: {v}"
-                                                      for k, v in (qm.items() if isinstance(qm, dict) else [])))
+    if qm is not None and hasattr(qm, "model_dump"):
+        qm = qm.model_dump()
+    if isinstance(qm, dict) and qm:
+        labels = {"lint_passed": "прошли проверку качества", "with_options": "с вариантами ответа",
+                  "closed_p0p1": "закрытые P0/P1", "grounded": "с цитатой из ТЗ", "with_default": "с допущением",
+                  "critical_covered": "критичные покрыты", "must_cover_covered": "обязательные покрыты"}
+        parts = []
+        for k, lab in labels.items():
+            v = qm.get(k)
+            if v is None:
+                continue
+            parts.append(f"{lab}: {v:.0%}" if isinstance(v, float) else f"{lab}: {v}")
+        st.caption("Качество вопросов — " + " · ".join(parts))
     g1, g2 = st.columns([2, 2])
     group = g1.radio("Группировка", ["По адресату", "По приоритету"], horizontal=True, label_visibility="collapsed")
     g2.button("✅ Принять рекомендуемые ответы для P0/P1", on_click=_accept_recommended, width="stretch")
@@ -531,7 +541,8 @@ with tabs[4]:
                 f"отсечено неподтверждённых {v.rejected_hallucinations}, понижено {v.downgraded} → **{v.output_findings}** в отчёте.")
     for attr, title in (("rejected", "Отсечено (галлюцинации / неподтверждённые цитаты)"),
                         ("downgraded_items", "Понижено (тема упоминается в ТЗ)"), ("downgrades", "Понижено (тема упоминается в ТЗ)"),
-                        ("merges", "Объединено (одна проблема от разных агентов)")):
+                        ("merges", "Объединено (одна проблема от разных агентов)"),
+                        ("restored", "Восстановлено после ревизии (critic loop)")):
         items = _g(v, attr)
         if items:
             with st.expander(f"{title}: {len(items)}"):
