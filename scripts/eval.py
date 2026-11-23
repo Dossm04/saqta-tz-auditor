@@ -84,6 +84,10 @@ def evaluate(expected_file: Path, use_llm: bool, cfg: LLMConfig) -> dict:
     fps = []
     for m in exp.get("must_not_flag", []):
         for f in r.findings:
+            # «Не полностью описано: X» цитирует строку как контекст («тема упомянута здесь»),
+            # а не объявляет её дефектной — такие находки не считаются ложными срабатываниями.
+            if f.title.startswith("Не полностью описано"):
+                continue
             if f.evidence and _overlap(f, m["lines"]):
                 fps.append(f'L{m["lines"]}: {f.id} {f.title} — {m["why"]}')
     detected = sum(v[0] for v in by_kind.values())
