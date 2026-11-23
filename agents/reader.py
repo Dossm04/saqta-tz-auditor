@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 
-from agents.base import Agent, Context, load_prompt
+from agents.base import TZ_NOTE, Agent, Context, load_prompt
 from knowledge.domains import DOMAIN_LABELS, detect_domains
 from models import DocumentModel, Requirement
 
@@ -31,6 +31,28 @@ _ACTORS = {
 }
 
 
+def merge_models(rules_dm: DocumentModel, llm_dm: DocumentModel) -> DocumentModel:
+    """Объединяет модель правил и LLM: домены — объединение (безопаснее проверить лишний контроль,
+    чем пропустить), списки — объединение без дублей, пустые поля LLM берутся из правил."""
+    dm = llm_dm.model_copy(deep=True)
+    dm.domains = [d for d in DOMAIN_LABELS if d in set(llm_dm.domains) | set(rules_dm.domains)]
+    for attr in ("actors", "integrations", "data_categories", "features"):
+        merged = list(dict.fromkeys([*getattr(llm_dm, attr), *getattr(rules_dm, attr)]))
+        setattr(dm, attr, merged[:40])
+    if not dm.sections:
+        dm.sections = rules_dm.sections
+    if not dm.requirements:
+        dm.requirements = rules_dm.requirements
+    dm.requirements = dm.requirements[:80]
+    if not dm.title.strip() or dm.title == "Техническое задание":
+        dm.title = rules_dm.title
+    if not dm.summary.strip():
+        dm.summary = rules_dm.summary
+    if not dm.product_type.strip():
+        dm.product_type = rules_dm.product_type
+    return dm
+
+
 def _collect(text: str, mapping: dict[str, str]) -> list[str]:
     t = text.lower().replace("ё", "е")
     return list(dict.fromkeys(v for p, v in mapping.items() if re.search(p, t)))
@@ -43,15 +65,18 @@ class ReaderAgent(Agent):
     stage = 1
 
     async def run_llm(self, ctx: Context) -> tuple[int, str]:
-        dm = await self.ask(ctx, load_prompt("reader"), ctx.numbered_doc, DocumentModel)
-        rules_dm = self._rules_model(ctx)
-        # объединяем домены LLM и правил: безопаснее проверить лишний контроль, чем пропустить
-        dm.domains = [d for d in DOMAIN_LABELS if d in set(dm.domains) | set(rules_dm.domains)]
-        if not dm.sections:
-            dm.sections = rules_dm.sections
-        dm.requirements = dm.requirements[:80]
+        """LLM-обогащение модели документа. В конвейере идёт параллельно со стадией 2:
+        мгновенная модель правил уже лежит в ctx.doc_model, LLM дополняет её для вопросов, оценки и отчёта."""
+        rules_dm = ctx.doc_model if ctx.doc_model.sections or ctx.doc_model.requirements else self._rules_model(ctx)
+        user = f"{TZ_NOTE}\n{ctx.tz_block}"
+        if len(ctx.doc.numbered()) > ctx.cfg.max_doc_chars:   # длинное ТЗ: оглавление целиком, текст выше обрезан
+            user += f"\n\n## Оглавление всего ТЗ (текст выше обрезан)\n{ctx.doc.outline()}"
+        dm = await self.ask(ctx, load_prompt("reader"), user, DocumentModel)
+        dm = merge_models(rules_dm, dm)
+        added = [d for d in dm.domains if d not in rules_dm.domains]
         ctx.doc_model, ctx.domains = dm, dm.domains
-        return len(dm.requirements), f"домены: {', '.join(dm.domains) or '—'}"
+        return len(dm.requirements), (f"LLM-обогащение: домены {', '.join(dm.domains) or '—'}"
+                                      + (f" (+{', '.join(added)})" if added else ""))
 
     def run_rules(self, ctx: Context) -> tuple[int, str]:
         dm = self._rules_model(ctx)
