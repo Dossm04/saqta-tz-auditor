@@ -5,11 +5,48 @@
 """
 from __future__ import annotations
 
+import math
 import re
 from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+# ── нормализация списков из ответа LLM ─────────────────────────────────────────
+# Модель нередко отдаёт скаляр вместо списка («lines": 12, "evidence": "цитата") — это не должно
+# ронять весь ответ агента или превращать «123» в строки [1, 2, 3].
+
+def _as_list(v: Any) -> list[Any]:
+    if v is None:
+        return []
+    if isinstance(v, (list, tuple, set)):
+        return list(v)
+    if isinstance(v, dict):
+        return list(v.values())
+    return [v]
+
+
+def to_int_list(v: Any) -> list[int]:
+    """Номера строк: 12 → [12]; "L12, L14" → [12, 14]; ["L3", 5.0, "x"] → [3, 5]."""
+    if isinstance(v, str):
+        return [int(x) for x in re.findall(r"\d+", v)]
+    out: list[int] = []
+    for x in _as_list(v):
+        if isinstance(x, bool):
+            continue
+        if isinstance(x, int) or (isinstance(x, float) and math.isfinite(x)):
+            out.append(int(x))
+        elif isinstance(x, str):
+            out.extend(int(d) for d in re.findall(r"\d+", x))
+    return out
+
+
+def to_str_list(v: Any) -> list[str]:
+    """Список строк: "цитата" → ["цитата"]; 7 → ["7"]; пустые элементы отбрасываются."""
+    if isinstance(v, str):
+        return [v.strip()] if v.strip() else []
+    return [str(x).strip() for x in _as_list(v) if x is not None and str(x).strip()]
 
 
 class Severity(str, Enum):
@@ -121,20 +158,12 @@ class Finding(BaseModel):
     @field_validator("lines", mode="before")
     @classmethod
     def _norm_lines(cls, v: Any) -> Any:
-        out = []
-        for x in v or []:
-            try:
-                out.append(int(str(x).lstrip("Ll")))
-            except ValueError:
-                continue
-        return out
+        return to_int_list(v)
 
     @field_validator("evidence", mode="before")
     @classmethod
     def _norm_evidence(cls, v: Any) -> Any:
-        if isinstance(v, str):
-            return [v] if v.strip() else []
-        return [str(x) for x in (v or []) if str(x).strip()]
+        return to_str_list(v)
 
 
 class Priority(str, Enum):
@@ -178,9 +207,7 @@ class Question(BaseModel):
     @field_validator("answer_options", "related_findings", mode="before")
     @classmethod
     def _norm_str_list(cls, v: Any) -> Any:
-        if isinstance(v, str):
-            return [v] if v.strip() else []
-        return [str(x).strip() for x in (v or []) if str(x).strip()]
+        return to_str_list(v)
 
     @field_validator("impact", "default_assumption", "why", "context", "addressee", mode="before")
     @classmethod
@@ -228,6 +255,11 @@ class DocumentModel(BaseModel):
     sections: list[str] = Field(default_factory=list)
     requirements: list[Requirement] = Field(default_factory=list)
 
+    @field_validator("domains", "actors", "features", "integrations", "data_categories", "sections", mode="before")
+    @classmethod
+    def _norm_str_lists(cls, v: Any) -> Any:
+        return to_str_list(v)
+
 
 class ControlCheck(BaseModel):
     """Строка матрицы соответствия финтех/ИБ-контролям."""
@@ -245,6 +277,16 @@ class ControlCheck(BaseModel):
     @classmethod
     def _norm_status(cls, v: Any) -> Any:
         return normalize_control_status(v)
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def _norm_evidence(cls, v: Any) -> Any:
+        return to_str_list(v)
+
+    @field_validator("lines", mode="before")
+    @classmethod
+    def _norm_lines(cls, v: Any) -> Any:
+        return to_int_list(v)
 
 
 CONTROL_STATUSES = ("covered", "partial", "missing", "not_applicable")

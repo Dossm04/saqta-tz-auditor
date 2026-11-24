@@ -34,30 +34,68 @@ def load_prompt(name: str, **variables: Any) -> str:
 
 
 def extract_json(text: str) -> Any:
-    """Достаёт JSON из ответа модели (с учётом ```json-обёрток и текста вокруг)."""
+    """Достаёт JSON из ответа модели (с учётом ```json-обёрток и текста вокруг).
+
+    Если ответ — не чистый JSON, перебираются позиции «{» и «[» и с каждой пробуется
+    ``JSONDecoder.raw_decode``: текст после JSON (даже со скобками) не мешает. Предпочтение —
+    первому объекту (все схемы агентов — объекты); если объектов нет, возвращается первый массив."""
     t = text.strip()
     t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.IGNORECASE | re.MULTILINE).strip()
     try:
         return json.loads(t)
     except json.JSONDecodeError:
         pass
-    for open_ch, close_ch in (("{", "}"), ("[", "]")):
-        s, e = t.find(open_ch), t.rfind(close_ch)
-        if s != -1 and e > s:
-            try:
-                return json.loads(t[s:e + 1])
-            except json.JSONDecodeError:
-                continue
+    decoder = json.JSONDecoder()
+    first: Any = None
+    for m in re.finditer(r"[\[{]", t):
+        try:
+            obj, _ = decoder.raw_decode(t, m.start())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+        if first is None:
+            first = obj
+    if first is not None:
+        return first
     raise ValueError("в ответе модели не найден корректный JSON")
 
 
 class LLMError(RuntimeError):
-    pass
+    """Провайдер не дал валидного ответа. ``tokens`` — сколько токенов всё же потрачено на попытки
+    (агент учитывает их в трассировке и при откате на правила)."""
+
+    def __init__(self, message: str = "", tokens: int = 0):
+        super().__init__(message)
+        self.tokens = tokens
+
+
+# причины APIConnectionError, при которых повторять бессмысленно: сервер не слушает порт, DNS не резолвится,
+# запрос не собрать (например, ключ с пробелом/переводом строки → недопустимый заголовок)
+_FATAL_CONNECT_NAMES = frozenset({"ConnectError", "LocalProtocolError", "UnsupportedProtocol", "InvalidURL",
+                                  "gaierror", "ConnectionRefusedError"})
+
+
+def is_fatal_connection_error(e: BaseException) -> bool:
+    """APIConnectionError, вызванная отказом в соединении/DNS/протокольной ошибкой на нашей стороне
+    (а не перегрузкой или тайм-аутом провайдера). Смотрим цепочку __cause__/__context__."""
+    seen = 0
+    cur: BaseException | None = e
+    while cur is not None and seen < 6:
+        name = type(cur).__name__
+        if any(t.__name__ in _FATAL_CONNECT_NAMES for t in type(cur).__mro__) and "Timeout" not in name:
+            return True
+        cur = cur.__cause__ or cur.__context__
+        seen += 1
+    return False
 
 
 class LLMClient:
     """Обёртка над openai.AsyncOpenAI: JSON-режим, валидация с обратной связью,
     ротация резервных моделей и экспоненциальная пауза при перегрузке провайдера."""
+
+    CONNECT_RETRIES = 1            # отказ в соединении / DNS / протокольная ошибка: не более одного повтора
+    CONNECT_RETRY_PAUSE_S = 0.5
 
     def __init__(self, cfg: LLMConfig):
         import asyncio
@@ -95,11 +133,6 @@ class LLMClient:
         return hashlib.sha256(f"{head}\n{system}\n{user}".encode("utf-8")).hexdigest()[:32]
 
     async def chat_json(self, system: str, user: str, schema: type[T]) -> tuple[T, int]:
-        import asyncio
-        import random
-
-        import openai
-
         # кэш: тот же промпт → тот же ответ мгновенно (стабильное живое демо, экономия квоты)
         cache_file = None
         if self.cfg.cache:
@@ -107,7 +140,7 @@ class LLMClient:
             if cache_file.exists():
                 try:
                     result = schema.model_validate(extract_json(cache_file.read_text(encoding="utf-8")))
-                except (ValueError, ValidationError, OSError):
+                except (ValueError, TypeError, ValidationError, OSError):
                     cache_file.unlink(missing_ok=True)
                 else:
                     self.cache_hits += 1          # считаем попадание только после успешной валидации
@@ -117,10 +150,24 @@ class LLMClient:
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
-        tokens = 0
+        usage = [0]
+        try:
+            return await self._complete(messages, schema, cache_file, usage)
+        except LLMError as e:
+            e.tokens = usage[0]                   # потраченные на неудачные попытки токены не теряются
+            raise
+
+    async def _complete(self, messages: list[dict[str, str]], schema: type[T], cache_file: Path | None,
+                        usage: list[int]) -> tuple[T, int]:
+        import asyncio
+        import random
+
+        import openai
+
         last_error: Exception | None = None
         validation_failures = 0
         transient = 0
+        fatal_connect = 0
         deadline = time.monotonic() + self.cfg.call_budget_s
         while True:
             model = self.active_model
@@ -143,16 +190,28 @@ class LLMClient:
                     continue
                 raise LLMError(f"запрос отклонён провайдером: {e}") from e
             except openai.NotFoundError as e:
-                # модель не существует для этого ключа — убираем её из очереди навсегда
-                if len(self._models) > 1 and model in self._models:
+                # модель не существует для этого ключа — убираем её из очереди навсегда. Параллельный агент мог
+                # уже убрать её сам: тогда просто идём на следующую модель, а не сдаёмся.
+                if model in self._models and len(self._models) > 1:
                     self._models.remove(model)
                     self.switches.append(f"{model} удалена (404)")
+                if self._models and self.active_model != model:
                     continue
                 raise LLMError(f"модель {model} не найдена") from e
             except (openai.RateLimitError, openai.InternalServerError,
                     openai.APITimeoutError, openai.APIConnectionError) as e:
                 code = str(getattr(e, "status_code", None) or type(e).__name__)
                 last_error = e
+                if not isinstance(e, openai.APITimeoutError) and is_fatal_connection_error(e):
+                    # сервер не запущен / нет сети / DNS / битый ключ в заголовке: долгие ретраи бессмысленны
+                    fatal_connect += 1
+                    self.transient_errors += 1
+                    if fatal_connect > self.CONNECT_RETRIES:
+                        cause = e.__cause__ or e.__context__
+                        raise LLMError(f"нет соединения с провайдером ({type(cause).__name__ if cause else code}: "
+                                       f"{str(cause or e)[:160]})") from e
+                    await asyncio.sleep(min(self.CONNECT_RETRY_PAUSE_S, max(0.0, deadline - time.monotonic())))
+                    continue
                 transient += 1
                 self.transient_errors += 1
                 if time.monotonic() >= deadline:
@@ -167,7 +226,7 @@ class LLMClient:
                 raise LLMError(f"ошибка API: {e}") from e
 
             if resp.usage:
-                tokens += resp.usage.total_tokens or 0
+                usage[0] += resp.usage.total_tokens or 0
             content = (resp.choices[0].message.content or "").strip()
             content = re.sub(r"<thought>.*?</thought>", "", content, flags=re.S).strip()  # Gemma и др. «думают» в тексте
             try:
@@ -175,8 +234,8 @@ class LLMClient:
                 if cache_file is not None:
                     CACHE_DIR.mkdir(parents=True, exist_ok=True)
                     cache_file.write_text(content, encoding="utf-8")
-                return result, tokens
-            except (ValueError, ValidationError) as e:
+                return result, usage[0]
+            except (ValueError, TypeError, ValidationError) as e:
                 last_error = e
                 validation_failures += 1
                 if validation_failures > self.cfg.max_retries:
@@ -249,7 +308,11 @@ class Agent:
 
     async def ask(self, ctx: Context, system: str, user: str, schema: type[T]) -> T:
         assert ctx.llm is not None
-        result, used = await ctx.llm.chat_json(system, user, schema)
+        try:
+            result, used = await ctx.llm.chat_json(system, user, schema)
+        except LLMError as e:
+            self.tokens += getattr(e, "tokens", 0) or 0   # неудачные попытки тоже стоили токенов
+            raise
         self.tokens += used
         return result
 

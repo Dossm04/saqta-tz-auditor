@@ -3,25 +3,28 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, model_validator
 
 from agents import rules
 from agents.base import TZ_NOTE, Agent, Context, doc_model_brief, load_prompt, tz_wrap
 from knowledge.fintech_controls import CONTROLS_BY_ID, applicable_controls
 from knowledge.template import template_findings
-from models import CONTROL_STATUSES, ControlCheck, Finding
+from models import CONTROL_STATUSES, ControlCheck, Finding, normalize_control_status
 
 # поля, которыми владеет конвейер (ID, авторство, результат проверки): из ответа LLM они не принимаются
 SERVER_OWNED = frozenset({"id", "agent", "sources", "verified", "verification_note", "revision"})
 
 
+# Ключи верхнего уровня обязательны: ответ с чужими ключами ({"issues": [...]}) или пустой {} не проходит
+# валидацию — клиент просит модель исправить JSON, а такой ответ не попадает в кэш.
+
 class RawFindings(BaseModel):
-    findings: list[dict[str, Any]] = []
+    findings: list[dict[str, Any]]
 
 
 class RawFintech(BaseModel):
-    controls: list[dict[str, Any]] = []
-    findings: list[dict[str, Any]] = []
+    controls: list[dict[str, Any]]
+    findings: list[dict[str, Any]]
 
 
 def parse_findings(raw: list[dict[str, Any]], agent: str) -> list[Finding]:
@@ -33,7 +36,7 @@ def parse_findings(raw: list[dict[str, Any]], agent: str) -> list[Finding]:
         clean = {k: v for k, v in item.items() if k not in SERVER_OWNED}
         try:
             f = Finding.model_validate({**clean, "agent": agent})
-        except ValidationError:
+        except (ValueError, TypeError):           # ValidationError — подкласс ValueError
             continue
         if f.confidence >= 0.4 and f.title.strip():
             out.append(f)
@@ -78,8 +81,16 @@ async def ask_doc(agent: Agent, ctx: Context, system: str, extra: str, schema: t
     import asyncio
 
     parts = ctx.doc.chunks(chunk_size(ctx))
-    outs = await asyncio.gather(*(agent.ask(ctx, system, _chunk_message(ctx, extra, k, len(parts), a, b, text), schema)
-                                  for k, (a, b, text) in enumerate(parts, start=1)))
+    tasks = [asyncio.ensure_future(agent.ask(ctx, system, _chunk_message(ctx, extra, k, len(parts), a, b, text), schema))
+             for k, (a, b, text) in enumerate(parts, start=1)]
+    try:
+        outs = await asyncio.gather(*tasks)
+    except BaseException:
+        # один фрагмент упал → агент уходит на правила; остальные запросы не должны жечь квоту в фоне
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     ctx.send("orchestrator", agent.name, "chunks", len(parts), f"ТЗ разбито на {len(parts)} фрагментов по разделам")
     data: dict[str, list] = {}
     for o in outs:
@@ -92,15 +103,25 @@ async def ask_doc(agent: Agent, ctx: Context, system: str, extra: str, schema: t
             if not isinstance(item, dict) or not item.get("control_id"):
                 continue
             cid = item["control_id"]
-            st = str(item.get("status", "")).lower()
+            st = normalize_control_status(item.get("status"))     # «покрыто»/«fully covered» → covered
             cur = best.get(cid)
-            if cur is None or _STATUS_RANK.get(st, 1) > _STATUS_RANK.get(str(cur.get("status", "")).lower(), 1):
+            if cur is None or _STATUS_RANK.get(st, 1) > _STATUS_RANK.get(cur["status"], 1):
                 ev = (cur or {}).get("evidence", []) or []
-                best[cid] = {**item, "evidence": list(dict.fromkeys([*(item.get("evidence") or []), *ev]))}
+                best[cid] = {**item, "status": st, "evidence": _merge_quotes(item.get("evidence"), ev)}
             else:
-                cur["evidence"] = list(dict.fromkeys([*(cur.get("evidence") or []), *(item.get("evidence") or [])]))
+                cur["evidence"] = _merge_quotes(cur.get("evidence"), item.get("evidence"))
         data["controls"] = list(best.values())
     return schema.model_validate(data)
+
+
+def _merge_quotes(a: Any, b: Any) -> list[str]:
+    def as_list(v: Any) -> list[str]:
+        if v is None:
+            return []
+        if isinstance(v, (list, tuple)):
+            return [str(x) for x in v if x is not None]
+        return [str(v)]
+    return list(dict.fromkeys([*as_list(a), *as_list(b)]))
 
 
 def merge_control_status(cc: ControlCheck, base: ControlCheck, locate) -> ControlCheck:
@@ -150,6 +171,65 @@ class RawRevision(BaseModel):
     findings: list[dict[str, Any]] = []
     withdrawn: list[Any] = []
 
+    @model_validator(mode="before")
+    @classmethod
+    def _require_keys(cls, data: Any) -> Any:
+        # ответ без обоих ключей — не решение по возвращённым находкам, а ошибка формата
+        if isinstance(data, dict) and "findings" not in data and "withdrawn" not in data:
+            raise ValueError("нужны ключи findings и/или withdrawn")
+        return data
+
+
+# поля, которые ревизия менять не может: исправляется только цитата/формулировка, а не суть находки
+REVISION_LOCKED = frozenset({"ref", "category", "severity", "control_id"})
+REVISION_WINDOW = 15
+
+
+def revision_context(ctx: Context, items: list[tuple[Finding, Any]], radius: int = REVISION_WINDOW) -> str:
+    """Текст ТЗ для ревизии. Короткое ТЗ — целиком; длинное — окна ±radius строк вокруг ближайшей строки
+    Verifier и строк самой находки (плюс оглавление), а не обрезанное начало документа: иначе находки
+    из поздних фрагментов исправить невозможно."""
+    if not is_long(ctx):
+        return f"## Текст ТЗ\n{tz_wrap(ctx.numbered_doc)}"
+    n_lines = len(ctx.doc.lines)
+    centers: set[int] = set()
+    for f, rec in items:
+        bl = getattr(rec, "best_line", None)
+        if isinstance(bl, int) and 1 <= bl <= n_lines:
+            centers.add(bl)
+        centers.update(ln for ln in f.lines if 1 <= ln <= n_lines)
+    if not centers:
+        return f"## Текст ТЗ\n{tz_wrap(ctx.numbered_doc)}"
+    ranges: list[list[int]] = []
+    for c in sorted(centers):
+        a, b = max(1, c - radius), min(n_lines, c + radius)
+        if ranges and a <= ranges[-1][1] + 1:
+            ranges[-1][1] = max(ranges[-1][1], b)
+        else:
+            ranges.append([a, b])
+    rows: list[str] = []
+    total, budget, cut = 0, ctx.cfg.max_doc_chars, False
+    for a, b in ranges:
+        if rows:
+            rows.append("…")
+        for i in range(a, b + 1):
+            line = ctx.doc.lines[i - 1]
+            if not line.strip():
+                continue
+            row = f"L{i}: {line.rstrip()}"
+            total += len(row) + 1
+            if budget and total > budget:
+                cut = True
+                break
+            rows.append(row)
+        if cut:
+            rows.append("… [фрагменты обрезаны по лимиту]")
+            break
+    text = "\n".join(rows)
+    return (f"## Оглавление всего ТЗ\n{ctx.doc.outline()}\n\n"
+            f"## Фрагменты ТЗ вокруг возвращённых находок (±{radius} строк, нумерация строк исходная)\n"
+            f"{tz_wrap(text)}")
+
 
 async def revise_findings(agent: Agent, ctx: Context, items: list[tuple[Finding, Any]]) -> dict[int, Finding]:
     """Один раунд ревизии: агент-автор исправляет цитаты или снимает находки.
@@ -163,7 +243,7 @@ async def revise_findings(agent: Agent, ctx: Context, items: list[tuple[Finding,
         rows.append(f"{k}. [{f.severity.value}/{f.category.value}] {f.title}\n   описание: {f.description[:240]}\n"
                     f"   твоя цитата: {quotes}; строки: {', '.join('L' + str(n) for n in f.lines[:4]) or '—'}\n"
                     f"   замечание Verifier: {getattr(rec, 'reason', '')}{near}")
-    user = f"## Возвращённые находки\n" + "\n".join(rows) + f"\n\n## Текст ТЗ\n{tz_wrap(ctx.numbered_doc)}"
+    user = "## Возвращённые находки\n" + "\n".join(rows) + f"\n\n{revision_context(ctx, items)}"
     out = await agent.ask(ctx, REVISE_PROMPT, user, RawRevision)
     withdrawn = set()
     for w in out.withdrawn:
@@ -186,8 +266,9 @@ async def revise_findings(agent: Agent, ctx: Context, items: list[tuple[Finding,
                 "title": orig.title, "description": orig.description, "recommendation": orig.recommendation,
                 "suggested_text": orig.suggested_text, "regulation": orig.regulation, "question": orig.question,
                 "confidence": orig.confidence}
-        parsed = parse_findings([{**base, **{k: v for k, v in item.items() if k != "ref" and v not in (None, "")}}],
-                                agent.name)
+        # категория, серьёзность и контроль — от исходной находки: ревизия не может «перекрасить» галлюцинацию
+        patch = {k: v for k, v in item.items() if k not in REVISION_LOCKED and v is not None and v != ""}
+        parsed = parse_findings([{**base, **patch}], agent.name)
         if parsed:
             parsed[0].revision = 1
             revised[ref - 1] = parsed[0]
@@ -242,9 +323,17 @@ class CompletenessAgent(Agent):
         ctx.send("rules", self.name, "hints", len(checks),
                  f"пред-проверка разделов: есть {sum(c.present for c in checks)} из {len(checks)}")
         out = await ask_doc(self, ctx, system, extra, RawFindings)
-        findings = parse_findings(out.findings, self.name) + tpl
+        llm_findings = parse_findings(out.findings, self.name)
+        note = ""
+        if not llm_findings:
+            # LLM не дал ни одной находки, а правила видят пропуски — не теряем их (дубли уберёт Verifier)
+            rule_findings = rules.section_findings(ctx.doc, checks)
+            if rule_findings:
+                llm_findings = rule_findings
+                note = f"; LLM без находок — добавлены находки правил ({len(rule_findings)})"
+        findings = llm_findings + tpl
         ctx.findings_by_agent[self.name] = findings
-        return len(findings), f"пред-проверка: разделов {sum(c.present for c in checks)}/{len(checks)}{tpl_note}"
+        return len(findings), f"пред-проверка: разделов {sum(c.present for c in checks)}/{len(checks)}{tpl_note}{note}"
 
 
 # ── Consistency ───────────────────────────────────────────────────────────────
@@ -274,10 +363,16 @@ class ConsistencyAgent(Agent):
                  f"числовых конфликтов {sum(h.category.value == 'contradiction' for h in hints)}")
         out = await ask_doc(self, ctx, system, f"## Подсказки пред-проверки\n{hint_text}", RawFindings)
         findings = parse_findings(out.findings, self.name)
-        # «TBD / уточнить позже» — буквальный факт, оставляем всегда
-        findings += [h for h in hints if h.title.startswith("Открытый вопрос")]
+        note = ""
+        if not findings and hints:
+            # LLM не вернул ни одной находки, а правила нашли кандидатов — берём их (дубли уберёт Verifier)
+            findings = list(hints)
+            note = "; LLM без находок — добавлены находки правил"
+        else:
+            # «TBD / уточнить позже» — буквальный факт, оставляем всегда
+            findings += [h for h in hints if h.title.startswith("Открытый вопрос")]
         ctx.findings_by_agent[self.name] = findings
-        return len(findings), f"подсказок правил: {len(hints)}"
+        return len(findings), f"подсказок правил: {len(hints)}{note}"
 
 
 # ── FinTech / Security ────────────────────────────────────────────────────────
@@ -322,10 +417,12 @@ class FinTechSecurityAgent(Agent):
                 continue
             try:
                 cc = ControlCheck.model_validate(item)
-            except ValidationError:
+            except (ValueError, TypeError):
                 continue
             base = rule_checks.get(cc.control_id)
-            if base is None:
+            # применимость задают домены (правила + _topup_domains), а не LLM: «не применимый» контроль
+            # нельзя сделать missing/covered и получить из него ложную критичную находку
+            if base is None or base.status == "not_applicable":
                 continue
             merged[cc.control_id] = merge_control_status(cc, base, ctx.doc.locate_quote)
         ctx.controls = list(merged.values())
