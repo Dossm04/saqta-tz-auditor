@@ -79,6 +79,20 @@ _AREA_TITLES = {
 }
 
 
+_QUOTE = re.compile(r"\s*«([^»]*)»")
+
+
+def _strip_doc_quotes(answer: str, doc_norm: str) -> str:
+    """Убирает из ответа цитаты исходного ТЗ («FR-17. Переводы … без подтверждения…»): варианты ответа на
+    противоречия цитируют опасную строку, и в ТЗ v2 она снова сработала бы как дефект. Свои кавычки
+    автора (не цитаты ТЗ) остаются."""
+    def repl(m: re.Match) -> str:
+        inner = _norm(m.group(1).rstrip("…. ").strip())
+        return "" if len(inner) >= 12 and inner in doc_norm else m.group(0)
+
+    return re.sub(r"\s{2,}", " ", _QUOTE.sub(repl, answer)).strip()
+
+
 def build_revised_tz(doc: Document, report: Report, answers: dict[str, str] | None = None) -> tuple[str, dict[str, int]]:
     answers = {k: v.strip() for k, v in (answers or {}).items() if v and v.strip()}
     stats = {"replaced": 0, "added": 0, "answers": len(answers)}
@@ -111,12 +125,20 @@ def build_revised_tz(doc: Document, report: Report, answers: dict[str, str] | No
             out += [f"### {_AREA_TITLES.get(cat, cat.label)}", *items, ""]
             stats["added"] += len(items)
 
-    # 3) ответы на уточняющие вопросы
+    # 3) ответы на уточняющие вопросы (основная повестка + дополнительные вопросы сверх лимита встречи).
+    # Текст вопроса в ТЗ v2 не переносим: он цитирует опасную строку («…сохраняет CVV…») или
+    # называет риск («используются ли зарубежные облака?»), и перепроверка снова нашла бы в
+    # приложении то самое опасное требование. Пишем только ID вопроса, адресата и ответ.
     if answers:
-        qmap = {q.id: q for q in report.questions}
-        out += ["", "## Уточнения автора ТЗ (ответы на вопросы)", ""]
+        qmap = {q.id: q for q in [*report.questions, *(report.extra_questions or [])]}
+        doc_norm = _norm(doc.text)
+        lines = []
         for qid, ans in answers.items():
             q = qmap.get(qid)
             if q:
-                out += [f"- **{qid}. {q.question}**", f"  Ответ: {ans}"]
+                who = f" ({q.addressee})" if q.addressee else ""
+                lines.append(f"- **{qid}**{who}: {_strip_doc_quotes(ans, doc_norm)}")
+        stats["answers"] = len(lines)
+        if lines:
+            out += ["", "## Уточнения автора ТЗ (ответы на вопросы)", "", *lines]
     return "\n".join(out), stats
