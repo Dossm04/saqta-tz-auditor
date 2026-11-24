@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 
 from knowledge.antipatterns import ANTIPATTERNS
-from knowledge.domains import OUT_OF_SCOPE
+from knowledge.domains import OUT_OF_SCOPE, is_fintech
 from knowledge.fintech_controls import CONTROLS, Control
 from knowledge.language import (BOUND_MAX, BOUND_MAX_WORDS, BOUND_MIN, BOUND_MIN_WORDS, CHANNEL_QUALIFIERS,
                                 CLIENT_QUALIFIERS, CONFLICT_PAIRS, METRIC_PATTERNS, METRIC_QUALIFIERS,
@@ -143,7 +143,21 @@ def scan_sections(doc: Document) -> list[SectionCheck]:
     return out
 
 
+# ниже обычных 0.7, но выше порога Verifier (0.4): находка остаётся видна вместе с пояснением про язык
+FOREIGN_SECTION_CONFIDENCE = 0.45
+_FOREIGN_NOTE = {
+    "en": "ТЗ на английском языке: офлайн-проверка ищет русские заголовки разделов, раздел может присутствовать "
+          "под английским названием — проверьте вручную или используйте LLM-режим.",
+    "kk": "ТЗ на казахском языке: офлайн-проверка ищет русские заголовки разделов, раздел может присутствовать "
+          "под казахским названием — проверьте вручную или используйте LLM-режим.",
+}
+
+
 def section_findings(doc: Document, checks: list[SectionCheck]) -> list[Finding]:
+    """«Отсутствует раздел» по офлайн-чеклисту. Для нерусского ТЗ такие находки не критичны и с низкой
+    уверенностью: шаблоны заголовков русские, и «отсутствие» может быть просто непереведённым заголовком."""
+    lang = getattr(doc, "language", "ru")
+    foreign = lang in _FOREIGN_NOTE
     out = []
     for c in checks:
         s = c.section
@@ -157,6 +171,14 @@ def section_findings(doc: Document, checks: list[SectionCheck]) -> list[Finding]
                 description=f"Тема затронута (L{', L'.join(map(str, c.lines[:3]))}), но не задано ни одного числового значения — требование нельзя проверить. {s.why}",
                 evidence=ev, lines=c.lines[:3], recommendation=s.recommendation, question=s.question,
                 control_id=s.id, confidence=0.75,
+            ))
+        elif foreign:
+            # заголовки разделов ищутся по-русски: в английском/казахском ТЗ раздел может быть, но не найтись
+            out.append(Finding(
+                agent="completeness", category=Category(s.category), severity=Severity.minor,
+                title=f"Отсутствует раздел: {s.title}",
+                description=f"{_FOREIGN_NOTE[lang]} {s.why}", recommendation=s.recommendation,
+                question=s.question, control_id=s.id, confidence=FOREIGN_SECTION_CONFIDENCE,
             ))
         else:
             out.append(Finding(
@@ -195,15 +217,49 @@ def check_control(doc: Document, c: Control) -> ControlCheck:
     )
 
 
+# Контроли с applies_to="*" рассчитаны на «любой финтех-проект». Если ТЗ вообще не похоже на финтех
+# (ни одного домена и ни одного финтех-признака), применяются только общие ИБ/ПДн-контроли из этого списка,
+# а банковские и регуляторные (MFA клиента, certificate pinning, уведомление АРРФР, аутсорсинг/облако,
+# язык клиентских уведомлений) помечаются «не применимо».
+GENERIC_CONTROL_IDS = frozenset({
+    "SEC-AUTH-03",    # тайм-аут сессии и блокировка по попыткам
+    "SEC-AUTH-04",    # хранение и политика паролей
+    "SEC-ACC-01",     # разграничение доступа, аудит администраторов
+    "SEC-DATA-02",    # шифрование данных при хранении
+    "PRIV-01",        # согласие на сбор и обработку ПДн (закон о ПДн РК — для любого оператора)
+    "PRIV-02",        # локализация ПДн в РК (там же)
+    "PRIV-03",        # сроки хранения и удаление ПДн
+    "OPS-AUDIT-01",   # журналирование
+    "APPSEC-01",      # безопасная разработка
+})
+NON_FINTECH_COMMENT = "ТЗ не похоже на финтех-проект — банковский/регуляторный контроль не применяется"
+
+
+def is_generic_control(c: Control) -> bool:
+    """Общий ИБ/ПДн-контроль, применимый и к нефинтех-системам."""
+    return "*" in c.applies_to and c.id in GENERIC_CONTROL_IDS
+
+
+def control_applicability(c: Control, domains: list[str] | set[str], fintech: bool = True) -> str | None:
+    """None — контроль применим; иначе причина статуса «не применимо»."""
+    if set(domains).intersection(c.applies_to):
+        return None
+    if "*" in c.applies_to:
+        return None if fintech or is_generic_control(c) else NON_FINTECH_COMMENT
+    return "домен не затронут в ТЗ"
+
+
 def scan_controls(doc: Document, domains: list[str]) -> list[ControlCheck]:
-    ds = set(domains)
+    # пустой список доменов ещё не «не финтех»: короткое банковское ТЗ может не набрать двух совпадений
+    fintech = bool(domains) or is_fintech(doc.text or "\n".join(doc.lines))
     out = []
     for c in CONTROLS:
-        if "*" in c.applies_to or ds.intersection(c.applies_to):
+        reason = control_applicability(c, domains, fintech)
+        if reason is None:
             out.append(check_control(doc, c))
         else:
             out.append(ControlCheck(control_id=c.id, title=c.title, area=c.area, regulation=c.regulation,
-                                    status="not_applicable", comment="домен не затронут в ТЗ"))
+                                    status="not_applicable", comment=reason))
     return out
 
 
@@ -1005,27 +1061,70 @@ def scan_polarity_conflicts(doc: Document) -> list[Finding]:
     return out
 
 
+DUP_RATIO = 0.9      # порог похожести строк-дублей (SequenceMatcher.ratio)
+DUP_WINDOW = 400     # сравниваем строку с 399 следующими длинными строками
+DUP_MAX = 10
+
+
 def scan_duplicates(doc: Document) -> list[Finding]:
+    """Почти совпадающие длинные строки (ratio ≥ 0.9) в окне из 400 следующих.
+
+    Результат тот же, что при прямом сравнении каждой пары SequenceMatcher-ом, но дорогой ratio()
+    считается только для пар, прошедших точные верхние оценки ratio (ни одна не отсекает настоящий дубль):
+    1) по длинам — real_quick_ratio: 2·min(|a|,|b|)/(|a|+|b|);
+    2) по мультимножествам символов — quick_ratio (счётчики символов считаются один раз на строку);
+    3) по 4-граммам: при ratio = 2M/T совпавших блоков не больше T − 2M + 1, поэтому позиций строки a,
+       чья 4-грамма целиком лежит в совпавшем блоке (и значит есть в b), не меньше M − 3·(T − 2M + 1).
+    Поиск останавливается на DUP_MAX-й находке: прежде всё, что после неё, всё равно отбрасывалось."""
     reqs = [(i, l.strip()) for i, l in enumerate(doc.lines, start=1) if len(l.strip()) > 50]
-    out, seen = [], set()
-    for a in range(len(reqs)):
-        for b in range(a + 1, min(len(reqs), a + 400)):
+    low = [l.lower() for _, l in reqs]
+    lens = [len(s) for s in low]
+    grams: list[set[str] | None] = [None] * len(low)     # множества 4-грамм — лениво, только для пар после 1–2
+    counts: list[dict[str, int]] = []
+    for s in low:
+        c: dict[str, int] = {}
+        for ch in s:
+            c[ch] = c.get(ch, 0) + 1
+        counts.append(c)
+    n = len(reqs)
+    out: list[Finding] = []
+    for a in range(n):
+        na, ca = lens[a], counts[a]
+        for b in range(a + 1, min(n, a + DUP_WINDOW)):
+            nb = lens[b]
+            total = na + nb
+            if 2.0 * (na if na < nb else nb) / total < DUP_RATIO:          # real_quick_ratio
+                continue
+            cb = counts[b]
+            small, big = (ca, cb) if len(ca) <= len(cb) else (cb, ca)
+            inter = 0
+            for ch, v in small.items():
+                w = big.get(ch)
+                if w:
+                    inter += v if v < w else w
+            if 2.0 * inter / total < DUP_RATIO:                             # quick_ratio
+                continue
+            gb = grams[b]
+            if gb is None:
+                gb = grams[b] = {low[b][k:k + 4] for k in range(nb - 3)}
+            sa = low[a]
+            shared = sum(1 for k in range(na - 3) if sa[k:k + 4] in gb)
+            m_min = DUP_RATIO * total / 2                                    # M при ratio ровно 0.9
+            if shared < m_min - 3 * (total - 2 * m_min + 1) - 1e-6:         # 4-граммы
+                continue
+            r = SequenceMatcher(None, low[a], low[b]).ratio()
+            if r < DUP_RATIO:
+                continue
             i, la = reqs[a]
             j, lb = reqs[b]
-            if (i, j) in seen:
-                continue
-            r = SequenceMatcher(None, la.lower(), lb.lower()).quick_ratio()
-            if r < 0.9:
-                continue
-            r = SequenceMatcher(None, la.lower(), lb.lower()).ratio()
-            if r >= 0.9:
-                seen.add((i, j))
-                out.append(Finding(
-                    agent="consistency", category=Category.contradiction, severity=Severity.minor,
-                    title="Дублирующееся требование",
-                    description=f"Строки L{i} и L{j} практически совпадают ({r:.0%}). Дубли расходятся при правках и порождают противоречия.",
-                    evidence=[_clip(la), _clip(lb)], lines=[i, j],
-                    recommendation="Оставить требование в одном месте и сослаться на него по ID.",
-                    confidence=0.8,
-                ))
-    return out[:10]
+            out.append(Finding(
+                agent="consistency", category=Category.contradiction, severity=Severity.minor,
+                title="Дублирующееся требование",
+                description=f"Строки L{i} и L{j} практически совпадают ({r:.0%}). Дубли расходятся при правках и порождают противоречия.",
+                evidence=[_clip(la), _clip(lb)], lines=[i, j],
+                recommendation="Оставить требование в одном месте и сослаться на него по ID.",
+                confidence=0.8,
+            ))
+            if len(out) >= DUP_MAX:
+                return out
+    return out
