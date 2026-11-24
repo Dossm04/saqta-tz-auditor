@@ -31,9 +31,34 @@ _ACTORS = {
 }
 
 
-def merge_models(rules_dm: DocumentModel, llm_dm: DocumentModel) -> DocumentModel:
+def clip_words(s: str, n: int) -> str:
+    """Обрезает строку до n символов по границе слова, чтобы не разрезать число (ИИН, PAN, телефон):
+    обрезок номера уже не узнаётся детекторами ПДн режима конфиденциальности."""
+    if len(s) <= n:
+        return s
+    cut = s[:n]
+    if not s[n].isspace():
+        ws = max(cut.rfind(" "), cut.rfind("\t"))
+        if ws > 0:
+            cut = cut[:ws]
+        else:                              # одно длинное «слово» — хотя бы не оставляем обрезок числа
+            cut = re.sub(r"[\d \t\-]+$", "", cut) or cut
+    return cut.rstrip()
+
+
+def valid_requirements(reqs: list[Requirement], doc_lines: list[str]) -> list[Requirement]:
+    """Оставляет требования, чья строка существует и непуста (line=None — без привязки, допустимо)."""
+    n = len(doc_lines)
+    return [r for r in reqs if r.line is None or (1 <= r.line <= n and doc_lines[r.line - 1].strip())]
+
+
+def merge_models(rules_dm: DocumentModel, llm_dm: DocumentModel,
+                 doc_lines: list[str] | None = None) -> DocumentModel:
     """Объединяет модель правил и LLM: домены — объединение (безопаснее проверить лишний контроль,
-    чем пропустить), списки — объединение без дублей, пустые поля LLM берутся из правил."""
+    чем пропустить), списки — объединение без дублей, пустые поля LLM берутся из правил.
+
+    doc_lines — строки документа: требования LLM со ссылкой на несуществующую или пустую строку
+    отбрасываются; если валидных не осталось — берутся требования правил."""
     dm = llm_dm.model_copy(deep=True)
     dm.domains = [d for d in DOMAIN_LABELS if d in set(llm_dm.domains) | set(rules_dm.domains)]
     for attr in ("actors", "integrations", "data_categories", "features"):
@@ -41,6 +66,8 @@ def merge_models(rules_dm: DocumentModel, llm_dm: DocumentModel) -> DocumentMode
         setattr(dm, attr, merged[:40])
     if not dm.sections:
         dm.sections = rules_dm.sections
+    if doc_lines is not None:
+        dm.requirements = valid_requirements(dm.requirements, doc_lines)
     if not dm.requirements:
         dm.requirements = rules_dm.requirements
     dm.requirements = dm.requirements[:80]
@@ -72,7 +99,7 @@ class ReaderAgent(Agent):
         if len(ctx.doc.numbered()) > ctx.cfg.max_doc_chars:   # длинное ТЗ: оглавление целиком, текст выше обрезан
             user += f"\n\n## Оглавление всего ТЗ (текст выше обрезан)\n{ctx.doc.outline()}"
         dm = await self.ask(ctx, load_prompt("reader"), user, DocumentModel)
-        dm = merge_models(rules_dm, dm)
+        dm = merge_models(rules_dm, dm, ctx.doc.lines)
         added = [d for d in dm.domains if d not in rules_dm.domains]
         ctx.doc_model, ctx.domains = dm, dm.domains
         return len(dm.requirements), (f"LLM-обогащение: домены {', '.join(dm.domains) or '—'}"
@@ -105,7 +132,7 @@ class ReaderAgent(Agent):
             low = s.lower()
             kind = ("security" if re.search(r"безопас|шифр|аутент|парол|доступ", low) else
                     "nonfunctional" if re.search(r"доступност|время|производ|нагрузк|sla|%", low) else "functional")
-            reqs.append(Requirement(id=mid.group(1) if mid else f"R-{len(reqs) + 1}", text=s.lstrip("-*• ")[:220],
+            reqs.append(Requirement(id=mid.group(1) if mid else f"R-{len(reqs) + 1}", text=clip_words(s.lstrip("-*• "), 220),
                                     kind=kind, line=i))
         domains = detect_domains(doc.text)
         return DocumentModel(
@@ -114,5 +141,5 @@ class ReaderAgent(Agent):
                     f"Затронутые области: {', '.join(DOMAIN_LABELS[d] for d in domains) or 'не определены'}.",
             domains=domains, actors=_collect(doc.text, _ACTORS), integrations=_collect(doc.text, _INTEGRATIONS),
             data_categories=_collect(doc.text, _DATA), sections=sections[:60], requirements=reqs[:120],
-            features=[r.text[:90] for r in reqs if r.kind == "functional"][:20],
+            features=[clip_words(r.text, 90) for r in reqs if r.kind == "functional"][:20],
         )
