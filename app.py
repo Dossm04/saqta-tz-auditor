@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import html
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ from knowledge import DISCLAIMER
 from knowledge.domains import DOMAIN_LABELS
 from models import Report, Severity
 from parsing import Document, load_bytes, load_path, load_text
-from report import to_json, to_markdown
+from report import question_quality_line, to_json, to_markdown
 
 ROOT = Path(__file__).resolve().parent
 SAMPLES = {
@@ -76,16 +77,27 @@ def _g(obj: Any, name: str, default: Any = None) -> Any:
     return getattr(obj, name, default)
 
 
+def _same_endpoint(a: str | None, b: str | None) -> bool:
+    return (a or "").strip().rstrip("/").lower() == (b or "").strip().rstrip("/").lower()
+
+
+def _letters_profile(text: str) -> tuple[float, float]:
+    """(доля латиницы среди букв, доля казахских букв әғқңөұүһі среди кириллицы)."""
+    latin = sum(1 for ch in text if ("a" <= ch <= "z") or ("A" <= ch <= "Z"))
+    cyr = sum(1 for ch in text if "Ѐ" <= ch <= "ӿ")
+    kaz = sum(1 for ch in text.lower() if ch in "әғқңөұүһі")
+    letters = latin + cyr
+    return (latin / letters if letters else 0.0), (kaz / cyr if cyr else 0.0)
+
+
+MIN_DOC_LINES = 5                         # меньше — оценка бессмысленна, анализ блокируется
+FINTECH_DOMAINS = {"transfers", "cards", "kyc", "lending", "deposits", "crypto"}
+
+
 # ── Sidebar: провайдер LLM ────────────────────────────────────────────────────
 env_cfg = LLMConfig.from_env()
-DEFAULT_PRESETS = {
-    "Из .env": {},
-    "Офлайн-правила": {"offline": True},
-    "Google Gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai/", "model": "gemini-3.5-flash-lite"},
-    "Локальная модель (Ollama, контур банка)": {"base_url": "http://localhost:11434/v1", "model": "qwen2.5:14b-instruct"},
-    "OpenAI": {"base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini"},
-}
-presets = {"Из .env": {}, **(getattr(config_mod, "PROVIDER_PRESETS", None) or DEFAULT_PRESETS)}
+ENV_PRESET = "Из .env"
+presets = {ENV_PRESET: {}, **config_mod.PROVIDER_PRESETS}
 
 with st.sidebar:
     st.markdown("### 🛡️ Saqta TZ Auditor")
@@ -95,25 +107,46 @@ with st.sidebar:
     preset = presets[preset_name] or {}
     if _g(preset, "note"):
         st.caption(_g(preset, "note"))
-    offline = bool(_g(preset, "offline", False)) or "офлайн" in preset_name.lower()
-    base_url = st.text_input("Base URL", value=_g(preset, "base_url") or env_cfg.base_url or "", disabled=offline)
-    api_key = st.text_input("API key", value="", type="password", disabled=offline,
-                            placeholder="ключ задан в .env ✓" if env_cfg.api_key else "вставьте ключ")
-    model = st.text_input("Модель", value=_g(preset, "model") or env_cfg.model, disabled=offline)
-    overrides = dict(base_url=base_url or None, api_key=api_key or None, model=model)
-    if _g(preset, "fallback_models"):
-        fm = _g(preset, "fallback_models")
-        overrides["fallback_models"] = tuple(fm.split(",")) if isinstance(fm, str) else tuple(fm)
-    if _g(preset, "max_concurrency"):
-        overrides["max_concurrency"] = int(_g(preset, "max_concurrency"))
-    try:
-        cfg = env_cfg.with_overrides(**overrides)
-    except TypeError:
-        cfg = env_cfg.with_overrides(base_url=base_url or None, api_key=api_key or None, model=model)
+    offline = bool(_g(preset, "offline", False))
+    # Конфиг строится из пресета целиком (тайм-ауты, бюджет ожидания, резервные модели, приватность, ключ),
+    # поверх него — только то, что пользователь поменял в полях ниже.
+    if preset_name == ENV_PRESET:
+        base_cfg, pov = env_cfg, {}
+        default_url, default_model = env_cfg.base_url or "", env_cfg.model
+    else:
+        base_cfg, pov = env_cfg.with_preset(preset_name), config_mod.preset_overrides(preset_name)
+        default_url, default_model = pov.get("base_url") or "", pov.get("model") or ""
+    base_url = st.text_input("Base URL", value=default_url, disabled=offline, key=f"llm_url::{preset_name}",
+                             placeholder="https://…/v1")
+    url = base_url.strip() or None
+    # ключ из .env отправляем только на тот же эндпоинт, для которого он задан в .env
+    env_key_ok = bool((env_cfg.api_key or "").strip()) and _same_endpoint(url, env_cfg.base_url)
+    preset_key = (pov.get("api_key") or "").strip()
+    api_key = st.text_input("API key", value="", type="password", disabled=offline, key=f"llm_key::{preset_name}",
+                            placeholder="ключ из пресета ✓" if preset_key else
+                            "ключ задан в .env ✓" if env_key_ok else "вставьте ключ")
+    model = st.text_input("Модель", value=default_model, disabled=offline, key=f"llm_model::{preset_name}")
+    key = api_key.strip() or preset_key or ((env_cfg.api_key or "").strip() if env_key_ok else "") or None
+    if "fallback_models" in pov:
+        fallbacks = tuple(pov["fallback_models"] or ())
+    else:      # резервные модели из .env имеют смысл только для того же провайдера
+        fallbacks = env_cfg.fallback_models if _same_endpoint(url, env_cfg.base_url) else ()
+    cfg_problem = ""
+    if not offline and preset_name != ENV_PRESET and not url:
+        cfg_problem = "Укажите Base URL провайдера — без него анализ с LLM недоступен."
+    elif not offline and not model.strip():
+        cfg_problem = "Укажите модель — без неё анализ с LLM недоступен."
+    cfg = replace(base_cfg, base_url=url, api_key=key, model=model.strip() or base_cfg.model,
+                  fallback_models=fallbacks)
     local = bool(getattr(cfg, "is_local", False))
     if local and not cfg.api_key:
         cfg = cfg.with_overrides(api_key="local")
-    use_llm = (not offline) and cfg.enabled and st.toggle("Использовать LLM-агентов", value=True)
+    st.session_state["llm_cfg"] = cfg   # для отладки и UI-тестов
+    if cfg_problem:
+        st.warning(cfg_problem, icon="⚠️")
+    use_llm = (not offline) and not cfg_problem and cfg.enabled and st.toggle("Использовать LLM-агентов", value=True)
+    if not offline and not cfg_problem and not cfg.enabled:
+        st.caption("Для этого провайдера не задан ключ — анализ пойдёт на офлайн-правилах.")
     if use_llm:
         st.success(f"LLM-агенты + правила · {cfg.model}", icon="🧠")
         if local:
@@ -160,17 +193,45 @@ with st.expander("📐 Шаблон ТЗ (необязательно): пров�
     tpl_src = st.radio("Шаблон", ["Без шаблона", "Пример шаблона банка", "Загрузить шаблон организаторов"],
                        horizontal=True, label_visibility="collapsed")
     template: Document | None = None
-    if tpl_src == "Пример шаблона банка":
-        template = load_path(ROOT / "samples" / "template_example.md")
-    elif tpl_src == "Загрузить шаблон организаторов":
-        tup = st.file_uploader("Шаблон в .md, .txt, .docx или .pdf", type=["md", "txt", "docx", "pdf"], key="tpl")
-        if tup is not None:
-            template = load_bytes(tup.getvalue(), tup.name)
+    try:   # повреждённый или переименованный файл шаблона не должен ронять страницу
+        if tpl_src == "Пример шаблона банка":
+            template = load_path(ROOT / "samples" / "template_example.md")
+        elif tpl_src == "Загрузить шаблон организаторов":
+            tup = st.file_uploader("Шаблон в .md, .txt, .docx или .pdf", type=["md", "txt", "docx", "pdf"], key="tpl")
+            if tup is not None:
+                template = load_bytes(tup.getvalue(), tup.name)
+    except Exception as e:
+        st.error(f"Не удалось прочитать шаблон: {e}")
+        template = None
     if template is not None:
         from knowledge.template import sections_from_template
 
-        secs = sections_from_template(template)
-        st.caption(f"Разделов в шаблоне: {len(secs)} — " + "; ".join(s.title for s in secs[:12]))
+        try:
+            secs = sections_from_template(template)
+        except Exception as e:
+            st.error(f"Не удалось разобрать шаблон: {e}")
+            secs, template = [], None
+        if template is not None and not secs:
+            st.warning("В шаблоне не найдено ни одного раздела (скан PDF без текста или .docx без стилей заголовков) — "
+                       "проверка по шаблону выполняться не будет.")
+            template = None
+        elif secs:
+            st.caption(f"Разделов в шаблоне: {len(secs)} — " + "; ".join(s.title for s in secs[:12]))
+tpl_label = ("без шаблона" if template is None else
+             "пример шаблона банка" if tpl_src == "Пример шаблона банка" else f"«{template.name}»")
+
+# Проверки входа до анализа: слишком короткий текст и язык, на который не рассчитаны офлайн-правила
+block_reason = ""
+if doc is not None:
+    if doc.non_empty_count < MIN_DOC_LINES:
+        block_reason = (f"В ТЗ всего {doc.non_empty_count} непустых строк — этого недостаточно для оценки "
+                        f"(нужно хотя бы {MIN_DOC_LINES}). Добавьте текст требований.")
+        st.warning(block_reason, icon="⚠️")
+    latin_share, kaz_share = _letters_profile(doc.text)
+    if latin_share > 0.5 or kaz_share > 0.02:
+        lang = "английском" if latin_share > 0.5 else "казахском"
+        st.warning(f"Похоже, ТЗ на {lang} языке: офлайн-правила рассчитаны на русский язык, часть разделов и "
+                   "опасных требований может быть не распознана. Используйте LLM-режим.", icon="🌐")
 
 ss = st.session_state
 ss.setdefault("history", [])
@@ -220,11 +281,12 @@ def run(doc: Document, label: str, keep_prev: bool = False) -> None:
 
 
 c1, c2, _ = st.columns([1.3, 1.1, 3])
-if c1.button("🚀 Анализировать", type="primary", disabled=doc is None, width="stretch"):
-    ss.template = template
+if c1.button("🚀 Анализировать", type="primary", disabled=doc is None or bool(block_reason or cfg_problem),
+             width="stretch"):
+    ss.template, ss.template_label = template, tpl_label
     run(doc, doc.name)
 if c2.button("↺ Начать заново", width="stretch", disabled="report" not in ss):
-    for k in ("report", "doc", "prev_report", "history", "answers"):
+    for k in ("report", "doc", "prev_report", "history", "answers", "template", "template_label", "exports", "exports_for"):
         ss.pop(k, None)
     st.rerun()
 
@@ -269,6 +331,10 @@ m3.metric("🟡 Мелочь", sc["minor"])
 m4.metric("❓ Вопросов", len(report.questions), help=f"P0: {sum(q.priority.value == 'P0' for q in report.questions)}")
 m5.metric("🛡️ Контроли ИБ/регулятора", f"{cov}+{part}½ / {total}")
 st.caption("Области ТЗ: " + (", ".join(DOMAIN_LABELS.get(d, d) for d in report.document.domains) or "—"))
+if not FINTECH_DOMAINS & set(report.document.domains):
+    st.warning("ТЗ не похоже на финтех-проект: не найдено ни переводов, ни карт, ни KYC, ни кредитов, ни депозитов. "
+               "Финтех- и регуляторные проверки рассчитаны на банковские продукты — замечания про АРРФР, MFA "
+               "клиентов, certificate pinning и т. п. могут быть неприменимы к этому ТЗ.", icon="🏦")
 
 # ── До / После ────────────────────────────────────────────────────────────────
 prev: Report | None = ss.get("prev_report")
@@ -304,6 +370,7 @@ tabs = st.tabs([f"🗓 Повестка встречи ({len(report.questions)})
 with tabs[0]:
     findings_by_id = {f.id: f for f in report.findings}
     qs = report.questions
+    extra_qs = list(_g(report, "extra_questions", []) or [])
     rid = ss.run_id
 
     def _rec_index(q) -> int:
@@ -319,30 +386,63 @@ with tabs[0]:
             if q.answer_options and q.priority.value in ("P0", "P1"):
                 ss[f"r_{rid}_{q.id}"] = _opt_labels(q)[_rec_index(q)]
 
+    def _answer_from_state(q) -> str:
+        """Ответ на вопрос по состоянию виджетов (до их отрисовки), чтобы счётчики не отставали на клик."""
+        own = ss.get(f"t_{rid}_{q.id}")
+        own = own.strip() if isinstance(own, str) else ""
+        if not q.answer_options:
+            return own
+        choice = ss.get(f"r_{rid}_{q.id}")
+        if not isinstance(choice, str) or choice == "—":
+            return ""
+        choice = choice.removeprefix("★ ")
+        return own if choice == "Свой ответ" else choice
+
+    ss.answers = {q.id: a for q in [*qs, *extra_qs] if (a := _answer_from_state(q))}
+    main_ids = {q.id for q in qs}
+    answered = sum(1 for qid in ss.answers if qid in main_ids)
+    answered_extra = len(ss.answers) - answered
+
     total_min = sum(MEETING_MIN.get(q.priority.value, 2) for q in qs)
-    answered = sum(1 for q in qs if ss.answers.get(q.id))
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Вопросов", len(qs))
     k2.metric("Блокеров P0", sum(q.priority.value == "P0" for q in qs))
     k3.metric("Время встречи", f"≈{total_min} мин", help="P0 — 5 мин, P1 — 3 мин, P2 — 1 мин")
-    k4.metric("Отвечено", f"{answered}/{len(qs)}")
-    qm = _g(report, "question_quality")
-    if qm is not None and hasattr(qm, "model_dump"):
-        qm = qm.model_dump()
-    if isinstance(qm, dict) and qm:
-        labels = {"lint_passed": "прошли проверку качества", "with_options": "с вариантами ответа",
-                  "closed_p0p1": "закрытые P0/P1", "grounded": "с цитатой из ТЗ", "with_default": "с допущением",
-                  "critical_covered": "критичные покрыты", "must_cover_covered": "обязательные покрыты"}
-        parts = []
-        for k, lab in labels.items():
-            v = qm.get(k)
-            if v is None:
-                continue
-            parts.append(f"{lab}: {v:.0%}" if isinstance(v, float) else f"{lab}: {v}")
-        st.caption("Качество вопросов — " + " · ".join(parts))
+    k4.metric("Отвечено", f"{answered}/{len(qs)}" + (f" +{answered_extra} доп." if answered_extra else ""))
+    qq_line = question_quality_line(report) if _g(report, "question_quality") is not None else ""
+    if qq_line:
+        st.caption(qq_line)
     g1, g2 = st.columns([2, 2])
     group = g1.radio("Группировка", ["По адресату", "По приоритету"], horizontal=True, label_visibility="collapsed")
     g2.button("✅ Принять рекомендуемые ответы для P0/P1", on_click=_accept_recommended, width="stretch")
+
+    def _render_question(q) -> None:
+        pcls = q.priority.value.lower()
+        with st.container(border=True):
+            st.markdown(f'<span class="pill {pcls}">{q.priority.label}</span><span class="pill">{html.escape(q.addressee)}</span>'
+                        f'{"<span class=pill>⛔ блокер</span>" if q.blocking else ""}<span class="pill">{q.id}</span>',
+                        unsafe_allow_html=True)
+            st.markdown(f"**{q.question}**")
+            if q.context:
+                st.markdown(f"> {q.context}")
+            if q.why:
+                st.caption(f"Зачем: {q.why}")
+            if _g(q, "impact"):
+                st.caption(f"Если не ответить: {_g(q, 'impact')}")
+            if _g(q, "default_assumption"):
+                st.markdown(f'<div class="assume">Если ответа нет до старта — закладываем: {html.escape(_g(q, "default_assumption"))}</div>',
+                            unsafe_allow_html=True)
+            rel = [findings_by_id[r] for r in q.related_findings if r in findings_by_id]
+            if rel:
+                st.caption("Связано: " + ", ".join(f"{f.id} {f.severity.icon} {f.title}" for f in rel[:4]))
+            if q.answer_options:
+                choice = st.radio("Ответ", ["—", *_opt_labels(q), "Свой ответ"], key=f"r_{rid}_{q.id}",
+                                  label_visibility="collapsed")
+                if choice == "Свой ответ":
+                    st.text_input("Ваш ответ", key=f"t_{rid}_{q.id}")
+            else:
+                st.text_input("Ответ", key=f"t_{rid}_{q.id}", placeholder="Ответ автора ТЗ…",
+                              label_visibility="collapsed")
 
     if group == "По адресату":
         groups: dict[str, list] = {}
@@ -357,46 +457,14 @@ with tabs[0]:
         mins = sum(MEETING_MIN.get(q.priority.value, 2) for q in gqs)
         st.markdown(f"##### {gname} · {len(gqs)} вопр. · ≈{mins} мин")
         for q in gqs:
-            pcls = q.priority.value.lower()
-            with st.container(border=True):
-                st.markdown(f'<span class="pill {pcls}">{q.priority.label}</span><span class="pill">{html.escape(q.addressee)}</span>'
-                            f'{"<span class=pill>⛔ блокер</span>" if q.blocking else ""}<span class="pill">{q.id}</span>',
-                            unsafe_allow_html=True)
-                st.markdown(f"**{q.question}**")
-                if q.context:
-                    st.markdown(f"> {q.context}")
-                if q.why:
-                    st.caption(f"Зачем: {q.why}")
-                if _g(q, "impact"):
-                    st.caption(f"Если не ответить: {_g(q, 'impact')}")
-                if _g(q, "default_assumption"):
-                    st.markdown(f'<div class="assume">Если ответа нет до старта — закладываем: {html.escape(_g(q, "default_assumption"))}</div>',
-                                unsafe_allow_html=True)
-                rel = [findings_by_id[r] for r in q.related_findings if r in findings_by_id]
-                if rel:
-                    st.caption("Связано: " + ", ".join(f"{f.id} {f.severity.icon} {f.title}" for f in rel[:4]))
-                opts = list(q.answer_options)
-                if opts:
-                    choice = st.radio("Ответ", ["—", *_opt_labels(q), "Свой ответ"], key=f"r_{rid}_{q.id}",
-                                      label_visibility="collapsed")
-                    choice = choice.removeprefix("★ ") if isinstance(choice, str) else choice
-                    if choice == "Свой ответ":
-                        own = st.text_input("Ваш ответ", key=f"t_{rid}_{q.id}")
-                        if own.strip():
-                            ss.answers[q.id] = own
-                        else:
-                            ss.answers.pop(q.id, None)
-                    elif choice != "—":
-                        ss.answers[q.id] = choice
-                    else:
-                        ss.answers.pop(q.id, None)
-                else:
-                    ans = st.text_input("Ответ", key=f"t_{rid}_{q.id}", placeholder="Ответ автора ТЗ…",
-                                        label_visibility="collapsed")
-                    if ans.strip():
-                        ss.answers[q.id] = ans
-                    else:
-                        ss.answers.pop(q.id, None)
+            _render_question(q)
+
+    if extra_qs:
+        with st.expander(f"➕ Дополнительные вопросы ({len(extra_qs)}) — не вошли в лимит встречи, "
+                         "можно ответить письменно"):
+            st.caption("Ответы на эти вопросы тоже попадают в ТЗ v2 и в повестку (.md).")
+            for q in sorted(extra_qs, key=lambda x: x.priority.value):
+                _render_question(q)
 
     st.divider()
     revised, stats = build_revised_tz(doc, report, ss.answers)
@@ -405,8 +473,10 @@ with tabs[0]:
     b1, b2 = st.columns(2)
     if b1.button("🔁 Сформировать ТЗ v2 и перепроверить", type="primary", width="stretch"):
         name = Path(doc.name).stem + "_v2.md"
+        ss.template, ss.template_label = template, tpl_label   # текущий выбор шаблона, а не зафиксированный при анализе
         run(load_text(revised, name), name, keep_prev=True)
         st.rerun()
+    b1.caption(f"Перепроверка выполняется с текущим выбором шаблона: {tpl_label}.")
     b2.download_button("⬇️ Скачать ТЗ v2 (.md)", revised, file_name=Path(doc.name).stem + "_v2.md", width="stretch")
     if len(ss.history) > 1:
         st.markdown("**История проверок:** " + " → ".join(f"{n}: **{s}**" for n, s, _ in ss.history))
@@ -553,29 +623,54 @@ with tabs[4]:
 
 # ── Экспорт ───────────────────────────────────────────────────────────────────
 with tabs[5]:
-    from report_docx import to_docx
+    import report_docx
+
+    def _agenda_md(r: Report) -> str:
+        def block(items) -> list[str]:
+            out: list[str] = []
+            for q in items:
+                out.append(f"**{q.id} [{q.priority.value}]** {q.question}")
+                if q.context:
+                    out.append(f"> {q.context}")
+                out += [f"- [ ] {o}" for o in q.answer_options]
+                if _g(q, "default_assumption"):
+                    out.append(f"_По умолчанию:_ {_g(q, 'default_assumption')}")
+                out.append("Ответ: ______________________\n")
+            return out
+
+        agenda: list[str] = []
+        by_addr: dict[str, list] = {}
+        for q in r.questions:
+            by_addr.setdefault(q.addressee, []).append(q)
+        for addr, items in by_addr.items():
+            agenda.append(f"## {addr} — {len(items)} вопр.\n")
+            agenda += block(items)
+        extra = list(_g(r, "extra_questions", []) or [])
+        if extra:
+            agenda.append(f"## Дополнительные вопросы (вне лимита встречи) — {len(extra)} вопр.\n")
+            agenda += block(sorted(extra, key=lambda x: x.priority.value))
+        return f"# Повестка: уточнение ТЗ «{r.document.title}»\n\n" + "\n".join(agenda)
+
+    # Экспорт строится один раз на анализ (run_id), а не на каждый клик по ответам в повестке
+    if ss.get("exports_for") != ss.run_id or "exports" not in ss:
+        exports: dict[str, Any] = {"md": to_markdown(report), "json": to_json(report), "agenda": _agenda_md(report),
+                                   "docx": None, "docx_error": ""}
+        try:
+            exports["docx"] = report_docx.to_docx(report)
+        except Exception as e:  # Word-экспорт не должен ронять страницу
+            exports["docx_error"] = str(e)
+        ss.exports, ss.exports_for = exports, ss.run_id
+    exports = ss.exports
 
     stem = Path(report.document_name).stem
     e0, e1, e2, e3 = st.columns(4)
-    e0.download_button("📄 Отчёт (Word)", to_docx(report), file_name=f"{stem}_review.docx", width="stretch",
-                       mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", type="primary")
-    e1.download_button("📝 Отчёт (Markdown)", to_markdown(report), file_name=f"{stem}_review.md", width="stretch")
-    e2.download_button("🧾 Отчёт (JSON)", to_json(report), file_name=f"{stem}_review.json", width="stretch")
-    agenda = []
-    by_addr: dict[str, list] = {}
-    for q in report.questions:
-        by_addr.setdefault(q.addressee, []).append(q)
-    for addr, items in by_addr.items():
-        agenda.append(f"## {addr} — {len(items)} вопр.\n")
-        for q in items:
-            agenda.append(f"**{q.id} [{q.priority.value}]** {q.question}")
-            if q.context:
-                agenda.append(f"> {q.context}")
-            agenda += [f"- [ ] {o}" for o in q.answer_options]
-            if _g(q, "default_assumption"):
-                agenda.append(f"_По умолчанию:_ {_g(q, 'default_assumption')}")
-            agenda.append("Ответ: ______________________\n")
-    e3.download_button("🗓 Повестка встречи (.md)", f"# Повестка: уточнение ТЗ «{report.document.title}»\n\n" + "\n".join(agenda),
-                       file_name=f"{stem}_agenda.md", width="stretch")
+    if exports["docx"] is not None:
+        e0.download_button("📄 Отчёт (Word)", exports["docx"], file_name=f"{stem}_review.docx", width="stretch",
+                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", type="primary")
+    else:
+        e0.warning(f"Word-отчёт не сформирован: {exports['docx_error']}")
+    e1.download_button("📝 Отчёт (Markdown)", exports["md"], file_name=f"{stem}_review.md", width="stretch")
+    e2.download_button("🧾 Отчёт (JSON)", exports["json"], file_name=f"{stem}_review.json", width="stretch")
+    e3.download_button("🗓 Повестка встречи (.md)", exports["agenda"], file_name=f"{stem}_agenda.md", width="stretch")
     with st.expander("Предпросмотр отчёта"):
-        st.markdown(to_markdown(report))
+        st.markdown(exports["md"])
