@@ -526,8 +526,8 @@ class _CriticLLM:
             data = {"questions": []}
         elif "агент **Scorer**" in system:
             data = {"summary": "Кратко.", "strengths": []}
-        else:
-            data = {}
+        else:                                   # пустой, но корректно оформленный ответ (ключи обязательны)
+            data = {k: [] for k in schema.model_fields}
         return schema.model_validate(data), 5
 
 

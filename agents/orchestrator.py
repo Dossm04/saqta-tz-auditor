@@ -25,7 +25,7 @@ from agents.base import Agent, Context, LLMClient
 from agents.questions import QuestionAgent
 from agents.reader import ReaderAgent
 from agents.scorer import ScorerAgent
-from agents.verifier import VerifierAgent
+from agents.verifier import QUOTE_THRESHOLD, VerifierAgent
 from config import LLMConfig
 from knowledge.domains import DOMAIN_LABELS
 from knowledge.fintech_controls import CONTROLS_BY_ID
@@ -207,8 +207,9 @@ class Orchestrator:
         results = await asyncio.gather(*(revise_findings(by_name[n], ctx, items) for n, items in groups.items()),
                                        return_exceptions=True)
         returned = fixed = withdrawn = 0
-        revised_of: dict[int, Finding] = {}          # id(исходной находки) → исправленная
+        revised_of: dict[int, Finding] = {}          # id(исходной находки) → исправленная (с найденной цитатой)
         withdrawn_recs: list = []
+        unconfirmed_recs: list = []                  # «исправлено», но цитата так и не найдена в ТЗ
         notes = []
         for (name, items), res in zip(groups.items(), results):
             returned += len(items)
@@ -219,23 +220,29 @@ class Orchestrator:
                     r.outcome = "агент не ответил — находка остаётся отклонённой"
                 notes.append(f"{name}: ошибка ревизии ({str(res)[:60]})")
                 continue
+            accepted: list[Finding] = []
             for k, (o, r) in enumerate(items):
-                if k in res:
-                    revised_of[id(o)] = res[k]
-                else:
+                if k not in res:
                     r.outcome = "снято агентом после замечания Verifier"
                     withdrawn_recs.append(r)
+                elif _grounded(ctx, res[k]):
+                    revised_of[id(o)] = res[k]
+                    accepted.append(res[k])
+                else:
+                    # без дословной цитаты «исправление» — та же галлюцинация: исходная запись об отклонении остаётся
+                    r.outcome = "исправлено агентом, но цитата не найдена в ТЗ — находка остаётся отклонённой"
+                    unconfirmed_recs.append(r)
             n_fixed, n_withdrawn = len(res), len(items) - len(res)
             fixed += n_fixed
             withdrawn += n_withdrawn
             returned_ids = {id(o) for o, _ in items}
             keep = [f for f in ctx.findings_by_agent.get(name, []) if id(f) not in returned_ids]
-            ctx.findings_by_agent[name] = keep + [res[k] for k in sorted(res)]
+            ctx.findings_by_agent[name] = keep + accepted
             ctx.send(name, verifier.name, "revision", n_fixed, f"исправлено {n_fixed}, снято {n_withdrawn}")
             notes.append(f"{name}: исправлено {n_fixed}, снято {n_withdrawn}")
 
         restored_recs = []
-        if fixed:
+        if revised_of:
             # перепроверка всех находок (Verifier работает с копиями — исходные находки агентов не мутируют)
             verifier.run_rules(ctx)
             st = ctx.verifier
@@ -249,10 +256,11 @@ class Orchestrator:
                     if rv is not None and id(rv) not in failed_again:
                         r.outcome = "исправлено агентом и подтверждено повторно"
                         restored_recs.append(r)
-            st.rejected = st.rejected + withdrawn_recs       # снятые агентом в повторную проверку не попали
+            # снятые агентом и неподтверждённые исправления в повторную проверку не попали — их записи сохраняем
+            st.rejected = st.rejected + withdrawn_recs + unconfirmed_recs
             st.input_findings = prev.input_findings
         else:
-            st = prev                                         # всё снято: перепроверять нечего
+            st = prev                                         # всё снято или не подтверждено: перепроверять нечего
         st.restored = restored_recs
         st.rejected_hallucinations = len(st.rejected)
         st.revision_returned, st.revision_restored, st.revision_withdrawn = returned, len(restored_recs), withdrawn
@@ -262,6 +270,16 @@ class Orchestrator:
                         tokens=sum(by_name[n].tokens for n in groups) - tokens_before,
                         note=f"возвращено {returned}, исправлено {fixed}, снято {withdrawn}, "
                              f"восстановлено {len(restored_recs)}" + (f" | {'; '.join(notes)}" if notes else ""))
+
+
+def _grounded(ctx: Context, f: Finding) -> bool:
+    """Исправленная находка считается восстановленной, только если хотя бы одна её цитата дословно
+    (с тем же порогом, что у Verifier) найдена в ТЗ: номера строк без цитаты подтверждением не являются."""
+    for q in f.evidence:
+        ln, score = ctx.doc.locate_quote(q)
+        if ln and score >= QUOTE_THRESHOLD:
+            return True
+    return False
 
 
 def manual_review_hours(doc: Document, ctx: Context) -> float:
