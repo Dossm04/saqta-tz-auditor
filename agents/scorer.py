@@ -33,13 +33,32 @@ class SummaryOut(BaseModel):
     strengths: list[str] = []
 
 
+# Слишком короткий текст оценивать нельзя: однозначность и непротиворечивость считаются только по штрафам,
+# и пустой документ без требований получал бы по 100 баллов (и обгонял реальное дефектное ТЗ).
+MIN_LINES = 10                 # меньше непустых строк — «недостаточно текста»
+MIN_REQUIREMENTS = 10          # столько требований нужно, чтобы доверять «чистым» оценкам по тексту
+INSUFFICIENT_MAX_OVERALL = 15
+INSUFFICIENT_VERDICT = "Недостаточно текста для оценки"
+_TEXT_DIMENSIONS = {"clarity", "consistency", "testability"}
+
+
+def insufficient_text(ctx: Context) -> bool:
+    """Нет требований или меньше MIN_LINES непустых строк — оценке по формуле доверять нельзя."""
+    return not ctx.doc_model.requirements or ctx.doc.non_empty_count < MIN_LINES
+
+
 def compute_scores(ctx: Context) -> tuple[list[DimensionScore], int]:
     dims = []
+    short = insufficient_text(ctx)
+    text_factor = min(1.0, len(ctx.doc_model.requirements) / MIN_REQUIREMENTS) if short else 1.0
     for key, name, weight, cats in DIMENSIONS:
         fs = [f for f in ctx.findings if f.category in cats]
         penalty = sum(PENALTY[f.severity] * max(0.5, f.confidence) for f in fs)
         score = 100 * math.exp(-penalty / DECAY)
         comment = ""
+        if key in _TEXT_DIMENSIONS and short:
+            score *= text_factor
+            comment = "недостаточно текста для оценки"
         if key == "security":
             app = [c for c in ctx.controls if c.status != "not_applicable"]
             if app:
@@ -49,6 +68,8 @@ def compute_scores(ctx: Context) -> tuple[list[DimensionScore], int]:
         issues = {s.value: sum(1 for f in fs if f.severity == s) for s in Severity}
         dims.append(DimensionScore(key=key, name=name, score=round(score), weight=weight, issues=issues, comment=comment))
     overall = round(sum(d.score * d.weight for d in dims))
+    if short:
+        overall = min(overall, INSUFFICIENT_MAX_OVERALL)
     return dims, overall
 
 
@@ -70,6 +91,8 @@ class ScorerAgent(Agent):
         dims, overall = compute_scores(ctx)
         n_crit = sum(1 for f in ctx.findings if f.severity == Severity.critical)
         verdict, level = verdict_for(overall, n_crit)
+        if insufficient_text(ctx):
+            verdict, level = INSUFFICIENT_VERDICT, "not_ready"   # уровень — из существующих: UI ветвится по нему
         ctx.report_extra.update(dimensions=dims, overall=overall, verdict=verdict, verdict_level=level)
 
     def run_rules(self, ctx: Context) -> tuple[int, str]:
@@ -115,9 +138,11 @@ class ScorerAgent(Agent):
         covered = [c for c in ctx.controls if c.status == "covered" and c.lines]
         if covered:
             out.append("Описаны контроли: " + ", ".join(f"{c.title} (L{c.lines[0]})" for c in covered[:4]))
-        reqs = [r for r in ctx.doc_model.requirements if r.line]
+        # только требования, указывающие на существующую непустую строку ТЗ (номера от LLM-Reader не проверены)
+        reqs = sorted((r for r in ctx.doc_model.requirements if r.line and ctx.doc.line(r.line).strip()),
+                      key=lambda r: r.line)
         if len(reqs) >= 10:
-            out.append(f"Выделено {len(ctx.doc_model.requirements)} требований (L{reqs[0].line}–L{reqs[-1].line}) — "
+            out.append(f"Выделено {len(reqs)} требований (L{reqs[0].line}–L{reqs[-1].line}) — "
                        f"хорошая основа для трассировки")
         integ = [(name, ln) for name in ctx.doc_model.integrations[:5]
                  if (ln := _first_line(ctx, name))]

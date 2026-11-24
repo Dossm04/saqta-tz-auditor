@@ -16,6 +16,31 @@ from pathlib import Path
 _HEADING = re.compile(r"^\s*(#{1,6})\s+(.+?)\s*#*\s*$|^\s*(\d+(?:\.\d+){0,3})\.?\s+([А-ЯA-ZЁ][^.!?]{2,90})$")
 
 
+# --- язык документа -----------------------------------------------------------
+_LATIN = re.compile(r"[A-Za-z]")
+_CYRILLIC = re.compile(r"[Ѐ-ӿ]")
+_KAZAKH = re.compile(r"[әғқңөұүһіӘҒҚҢӨҰҮҺІ]")
+LANG_MIN_LETTERS = 40      # меньше букв — язык не определяем (считаем русским)
+LANG_LATIN_SHARE = 0.6     # в русских финтех-ТЗ много латиницы (API, PCI DSS, URL), поэтому порог высокий
+LANG_KAZAKH_SHARE = 0.04   # доля казахских букв среди кириллицы; в русском ТЗ это единичные имена/топонимы
+
+
+def detect_language(text: str) -> str:
+    """Грубое определение языка по алфавиту: 'ru' | 'kk' | 'en'.
+
+    Смешанный русско-казахский текст считается казахским только при заметной доле букв әғқңөұүһі."""
+    text = text or ""
+    lat = len(_LATIN.findall(text))
+    cyr = len(_CYRILLIC.findall(text))
+    if lat + cyr < LANG_MIN_LETTERS:
+        return "ru"
+    if lat / (lat + cyr) > LANG_LATIN_SHARE:
+        return "en"
+    if cyr and len(_KAZAKH.findall(text)) / cyr >= LANG_KAZAKH_SHARE:
+        return "kk"
+    return "ru"
+
+
 def _ratio(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
@@ -52,6 +77,14 @@ class Document:
         self._norm_full = " ".join(parts)
         self._char_counts: list[Counter] | None = None   # лениво: для верхней оценки похожести
         self._quote_cache: dict[str, tuple[int | None, float]] = {}
+        self._language: str | None = None
+
+    @property
+    def language(self) -> str:
+        """Язык ТЗ: 'ru' | 'kk' | 'en'. Офлайн-правила (разделы, домены, опасные требования) рассчитаны на русский."""
+        if self._language is None:
+            self._language = detect_language(self.text or "\n".join(self.lines))
+        return self._language
 
     # --- представление для LLM -------------------------------------------------
     def numbered(self, max_chars: int | None = None) -> str:
@@ -203,41 +236,69 @@ class Document:
 
 # --- загрузчики ---------------------------------------------------------------
 
+def _tag(el) -> str:
+    return el.tag.rsplit("}", 1)[-1] if isinstance(el.tag, str) else ""
+
+
+def _paragraph_text(p, el) -> str:
+    """Текст абзаца. python-docx не видит строчные элементы управления содержимым (w:sdt внутри абзаца,
+    например поля формы), поэтому для таких абзацев текст собирается из всех w:t по порядку."""
+    if not any(_tag(x) == "sdt" for x in el.iter()):
+        return p.text
+    parts = []
+    for x in el.iter():
+        t = _tag(x)
+        if t == "t":
+            parts.append(x.text or "")
+        elif t in ("tab", "br", "cr"):
+            parts.append(" ")
+    return "".join(parts)
+
+
 def _read_docx(data: bytes) -> str:
     import docx  # python-docx
 
     d = docx.Document(io.BytesIO(data))
     out: list[str] = []
-    body = d.element.body
-    for child in body.iterchildren():
-        tag = child.tag.rsplit("}", 1)[-1]
-        if tag == "p":
-            p = docx.text.paragraph.Paragraph(child, d)
-            text = p.text.strip()
-            if not text:
+
+    def emit(container) -> None:
+        for child in container.iterchildren():
+            tag = _tag(child)
+            if tag == "p":
+                p = docx.text.paragraph.Paragraph(child, d)
+                text = _paragraph_text(p, child).strip()
+                if not text:
+                    out.append("")
+                    continue
+                style = (p.style.name or "").lower() if p.style is not None else ""
+                m = re.search(r"(heading|заголовок)\s*(\d)", style)
+                if m:
+                    out.append("#" * int(m.group(2)) + " " + text)
+                elif "list" in style or "спис" in style:
+                    out.append("- " + text)
+                else:
+                    out.append(text)
+            elif tag == "tbl":
+                t = docx.table.Table(child, d)
+                for row in t.rows:
+                    cells, prev_tc = [], None
+                    for c in row.cells:
+                        # объединённая по горизонтали ячейка возвращается несколько раз с тем же _tc;
+                        # одинаковый текст в соседних, но разных ячейках сохраняется
+                        if prev_tc is not None and c._tc is prev_tc:
+                            continue
+                        prev_tc = c._tc
+                        cells.append(c.text.strip().replace("\n", " "))
+                    out.append("| " + " | ".join(cells) + " |")
                 out.append("")
-                continue
-            style = (p.style.name or "").lower() if p.style is not None else ""
-            m = re.search(r"(heading|заголовок)\s*(\d)", style)
-            if m:
-                out.append("#" * int(m.group(2)) + " " + text)
-            elif "list" in style or "спис" in style:
-                out.append("- " + text)
-            else:
-                out.append(text)
-        elif tag == "tbl":
-            t = docx.table.Table(child, d)
-            for row in t.rows:
-                cells, prev_tc = [], None
-                for c in row.cells:
-                    # объединённая по горизонтали ячейка возвращается несколько раз с тем же _tc;
-                    # одинаковый текст в соседних, но разных ячейках сохраняется
-                    if prev_tc is not None and c._tc is prev_tc:
-                        continue
-                    prev_tc = c._tc
-                    cells.append(c.text.strip().replace("\n", " "))
-                out.append("| " + " | ".join(cells) + " |")
-            out.append("")
+            elif tag == "sdt":
+                # блочный элемент управления содержимым (поля шаблона, титул, оглавление, целые разделы):
+                # абзацы и таблицы лежат в w:sdtContent, в том числе во вложенных sdt
+                for content in child.iterchildren():
+                    if _tag(content) == "sdtContent":
+                        emit(content)
+
+    emit(d.element.body)
     return "\n".join(out)
 
 
@@ -281,6 +342,19 @@ def _decode(data: bytes) -> str:
         return data.decode("utf-8", errors="replace")
 
 
+_LINE_BREAK_CTRL = re.compile(r"[\x0b\x0c\x1c-\x1e]")   # str.splitlines() и так делит по ним строки
+_CTRL = re.compile(r"[\x01-\x08\x0e-\x1b\x1f\x7f]")
+
+
+def _clean(text: str) -> str:
+    """Переводы строк приводятся к LF; управляющие символы C0 убираются: их не принимает XML,
+    и экспорт отчёта в Word падал бы на цитатах. Разделители страниц/строк (\\f, \\v, \\x1c–\\x1e)
+    становятся переводом строки, поэтому нумерация строк не меняется."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+    text = _LINE_BREAK_CTRL.sub("\n", text)
+    return _CTRL.sub(" ", text)
+
+
 def load_bytes(data: bytes, filename: str) -> Document:
     ext = Path(filename).suffix.lower()
     if ext == ".docx":
@@ -289,7 +363,7 @@ def load_bytes(data: bytes, filename: str) -> Document:
         text = _read_pdf(data)
     else:
         text = _decode(data)
-    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", "    ").replace("\x00", "")
+    text = _clean(text.replace("\t", "    "))
     return Document(name=Path(filename).name, text=text)
 
 
@@ -299,4 +373,4 @@ def load_path(path: str | Path) -> Document:
 
 
 def load_text(text: str, name: str = "pasted.md") -> Document:
-    return Document(name=name, text=text.replace("\r\n", "\n"))
+    return Document(name=name, text=_clean(text))

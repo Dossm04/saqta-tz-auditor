@@ -115,14 +115,18 @@ def kb_meta(f: Finding) -> KBMeta:
     obj = CONTROLS_BY_ID.get(cid) or _SECTIONS.get(cid) or _APS.get(cid)
     if obj is None:
         return KBMeta()
+    options = [str(o) for o in (getattr(obj, "answer_options", None) or ()) if str(o).strip()]
     rec = getattr(obj, "recommended_option", None)
+    if not (isinstance(rec, int) and not isinstance(rec, bool) and 0 <= rec < len(options)):
+        # соглашение базы знаний (Control/AntiPattern/Section.answer_options): первый вариант — рекомендуемый
+        rec = 0 if options else None
     return KBMeta(
         why=str(getattr(obj, "why", "") or getattr(obj, "description", "") or ""),
         addressee=str(getattr(obj, "addressee", "") or ("ИБ / Комплаенс" if cid in _APS else "")),
-        options=[str(o) for o in (getattr(obj, "answer_options", None) or ()) if str(o).strip()],
+        options=options,
         default_assumption=str(getattr(obj, "default_assumption", "") or ""),
         impact=str(getattr(obj, "impact", "") or ""),
-        recommended=rec if isinstance(rec, int) and not isinstance(rec, bool) else None,
+        recommended=rec,
     )
 
 
@@ -408,13 +412,17 @@ def backfill(q: Question, by_id: dict[str, Finding], doc: Document | None = None
     related = [by_id[r] for r in q.related_findings if r in by_id]
     if len(substantive_options(q)) < 2:
         contra = next((f for f in related if f.category == Category.contradiction and not is_duplicate(f)), None)
-        kb_opts = next((kb_meta(f).options for f in related if len(kb_meta(f).options) >= 2), [])
+        kb_src = next((kb for kb in (kb_meta(f) for f in related) if len(kb.options) >= 2), None)
+        # варианты заменяются — индекс рекомендации LLM относился к старому списку и не сохраняется
         if contra is not None:
             cq = contradiction_question(contra, doc)
             q.answer_options = cq.answer_options
+            q.recommended_option = cq.recommended_option
             q.default_assumption = q.default_assumption or cq.default_assumption
-        elif kb_opts:
-            q.answer_options = list(kb_opts)
+        elif kb_src is not None:
+            q.answer_options = list(kb_src.options)
+            q.recommended_option = _recommended(q.answer_options, kb_src,
+                                                q.default_assumption or kb_src.default_assumption)
         else:
             fallback = next((o for o in (_decision_options(f) for f in related) if o), [])
             if fallback:
@@ -661,12 +669,13 @@ class QuestionAgent(Agent):
                         f"{finding_cards([f for f in ctx.findings if f.id in rel], ctx.doc)}")
             try:
                 fixed = await self.ask(ctx, system, fix_user, RawQuestions)
+                done: set[int] = set()      # повтор одного ref (модель разбила вопрос на части) не считается дважды
                 for ref, q in _parse(fixed.questions, set(by_id)):
                     try:
                         k = int(str(ref).strip())
                     except (TypeError, ValueError):
                         continue
-                    if not 1 <= k <= len(failing):
+                    if not 1 <= k <= len(failing) or k in done:
                         continue
                     i, old, errs = failing[k - 1]
                     q = backfill(q, by_id, ctx.doc)
@@ -674,6 +683,7 @@ class QuestionAgent(Agent):
                         q.related_findings = list(dict.fromkeys(old.related_findings + q.related_findings))
                         qs[i] = q
                         repaired += 1
+                        done.add(k)
             except Exception:   # исправление — бонус; без него остаются вопросы с пометками линтера
                 pass
         return self._store(ctx, qs, repaired, f"от LLM {n_llm}, исправлено по чеклисту {repaired}")
