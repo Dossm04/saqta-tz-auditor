@@ -302,7 +302,7 @@ def _read_docx(data: bytes) -> str:
     return "\n".join(out)
 
 
-def _read_pdf(data: bytes) -> str:
+def _read_pdf_plain(data: bytes) -> str:
     import pdfplumber
 
     pages = []
@@ -310,6 +310,19 @@ def _read_pdf(data: bytes) -> str:
         for page in pdf.pages:
             pages.append(page.extract_text() or "")
     return "\n".join(pages)
+
+
+def _read_pdf(data: bytes) -> tuple[str, list[int] | None]:
+    """Структурное чтение (заголовки, таблицы, абзацы, страницы); при сбое — простое извлечение текста."""
+    try:
+        from pdf_reader import read_pdf_structured
+
+        text, pages = read_pdf_structured(data)
+        if text.strip():
+            return text, pages
+    except Exception:
+        pass
+    return _read_pdf_plain(data), None
 
 
 def _decode(data: bytes) -> str:
@@ -357,14 +370,18 @@ def _clean(text: str) -> str:
 
 def load_bytes(data: bytes, filename: str) -> Document:
     ext = Path(filename).suffix.lower()
+    pages: list[int] | None = None
     if ext == ".docx":
         text = _read_docx(data)
     elif ext == ".pdf":
-        text = _read_pdf(data)
+        text, pages = _read_pdf(data)
     else:
         text = _decode(data)
     text = _clean(text.replace("\t", "    "))
-    return Document(name=Path(filename).name, text=text)
+    doc = Document(name=Path(filename).name, text=text)
+    if pages is not None and len(pages) == len(doc.lines):
+        doc.line_pages = pages          # номер страницы PDF для каждой строки (ссылки в отчёте)
+    return doc
 
 
 def load_path(path: str | Path) -> Document:

@@ -20,6 +20,11 @@ def _bool(v: str | None, default: bool) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "on")
 
 
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+GEMINI_DEFAULT_MODEL = "gemini-3.5-flash-lite"
+# резервные модели: при 404 (устаревшая модель, например gemini-1.5-flash) или перегрузке 429/503
+GEMINI_FALLBACKS = ("gemini-flash-lite-latest", "gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-flash-latest")
+
 PRIVACY_MODES = ("auto", "on", "off")
 _LOCAL_NAMES = {"localhost", "host.docker.internal", "gateway.docker.internal", "0.0.0.0"}
 _LOCAL_SUFFIXES = (".local", ".localhost", ".internal")
@@ -97,15 +102,26 @@ class LLMConfig:
 
     @classmethod
     def from_env(cls) -> "LLMConfig":
+        # Совместимость с .env.example организаторов: GEMINI_API_KEY / OPENAI_API_KEY без LLM_* переменных
+        base_url, api_key, model = os.getenv("LLM_BASE_URL") or None, os.getenv("LLM_API_KEY") or None, os.getenv("LLM_MODEL")
+        fallbacks = os.getenv("LLM_FALLBACK_MODELS", "")
+        if not api_key and os.getenv("GEMINI_API_KEY") and "your_" not in os.getenv("GEMINI_API_KEY", ""):
+            api_key = os.getenv("GEMINI_API_KEY")
+            base_url = base_url or GEMINI_BASE_URL
+            model = model or os.getenv("GEMINI_MODEL") or GEMINI_DEFAULT_MODEL
+            fallbacks = fallbacks or ",".join(GEMINI_FALLBACKS)
+        elif not api_key and os.getenv("OPENAI_API_KEY") and "your_" not in os.getenv("OPENAI_API_KEY", ""):
+            api_key = os.getenv("OPENAI_API_KEY")
+            model = model or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
         return cls(
-            base_url=os.getenv("LLM_BASE_URL") or None,
-            api_key=os.getenv("LLM_API_KEY") or None,
-            model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
+            base_url=base_url,
+            api_key=api_key,
+            model=model or "gpt-4o-mini",
             temperature=float(os.getenv("LLM_TEMPERATURE", "0.1")),
             json_mode=_bool(os.getenv("LLM_JSON_MODE"), True),
             timeout=float(os.getenv("LLM_TIMEOUT", "180")),
             max_doc_chars=int(os.getenv("LLM_MAX_DOC_CHARS", "80000")),
-            fallback_models=tuple(m.strip() for m in os.getenv("LLM_FALLBACK_MODELS", "").split(",") if m.strip()),
+            fallback_models=tuple(m.strip() for m in fallbacks.split(",") if m.strip()),
             max_concurrency=int(os.getenv("LLM_MAX_CONCURRENCY", "3")),
             call_budget_s=float(os.getenv("LLM_CALL_BUDGET", "150")),
             cache=_bool(os.getenv("LLM_CACHE"), True),
