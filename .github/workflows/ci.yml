@@ -21,3 +21,7 @@ jobs:
         run: python -m pytest -q tests
       - name: Quality eval on labeled TZ samples (offline rules)
         run: python scripts/eval.py --min-recall 0.8 --max-fp 0
+      - name: Hackathon case — one-command run on the case document (offline)
+        run: |
+          python validate.py examples/case_requirements.pdf reports/ci_report.md --offline
+          python scripts/eval_iso.py --min-recall 0.4
