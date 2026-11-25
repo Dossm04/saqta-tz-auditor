@@ -19,7 +19,24 @@ def _app():
     from streamlit.testing.v1 import AppTest
 
     os.environ["LLM_API_KEY"] = ""
-    return AppTest.from_file(str(ROOT / "app.py"), default_timeout=60)
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60)
+    at.session_state["app_mode"] = "Финтех-аудит ТЗ (повестка, ТЗ v2)"
+    return at
+
+
+def test_iso_mode_page_runs_offline():
+    from streamlit.testing.v1 import AppTest
+
+    os.environ["LLM_API_KEY"] = ""
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=120).run()
+    assert not at.exception
+    sb = at.sidebar.selectbox[0]
+    sb.set_value(next(o for o in sb.options if "Офлайн" in o)).run()
+    _button(at, "Проверить требования").click().run()
+    assert not at.exception, at.exception
+    text = " ".join(m.value for m in at.markdown)
+    assert "Нет. Начинать разработку" in text
+    assert any("Нарезка требований" in str(t.label) for t in at.tabs)
 
 
 def _button(at, text):

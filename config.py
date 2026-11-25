@@ -21,7 +21,7 @@ def _bool(v: str | None, default: bool) -> bool:
 
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-GEMINI_DEFAULT_MODEL = "gemini-3.5-flash-lite"
+GEMINI_DEFAULT_MODEL = "gemini-3.5-flash"
 # резервные модели: при 404 (устаревшая модель, например gemini-1.5-flash) или перегрузке 429/503
 GEMINI_FALLBACKS = ("gemini-flash-lite-latest", "gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-flash-latest")
 

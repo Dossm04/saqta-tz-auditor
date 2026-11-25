@@ -25,7 +25,9 @@ def _offline(monkeypatch):
 def _app():
     from streamlit.testing.v1 import AppTest
 
-    return AppTest.from_file(str(ROOT / "app.py"), default_timeout=90)
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=90)
+    at.session_state["app_mode"] = "Финтех-аудит ТЗ (повестка, ТЗ v2)"
+    return at
 
 
 def _button(at, text):

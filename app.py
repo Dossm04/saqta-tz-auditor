@@ -158,7 +158,16 @@ with st.sidebar:
     else:
         st.info("Офлайн-режим: детерминированные агенты на базе знаний (без LLM).", icon="⚙️")
     st.divider()
+    app_mode = st.radio("Режим", ["Проверка требований (ISO 29148) — задание хакатона", "Финтех-аудит ТЗ (повестка, ТЗ v2)"],
+                        key="app_mode")
+    st.divider()
     st.caption(DISCLAIMER)
+
+if app_mode.startswith("Проверка требований"):
+    import app_iso
+
+    app_iso.render(cfg, use_llm, ROOT)
+    st.stop()
 
 
 # ── Ввод ──────────────────────────────────────────────────────────────────────
