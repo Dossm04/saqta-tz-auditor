@@ -8,8 +8,10 @@
   3. Requirement Critic — LLM оценивает каждое требование пакетами по 10 характеристикам + риски ИБ;
   4. Set Critic         — LLM оценивает набор: противоречия, пропуски, чек-лист документа, вопросы автору;
   5. Contradiction Hunter — LLM ищет пары взаимоисключающих требований;
-  6. Domain Critic      — доменный чек-лист финтеха (время и часовой пояс, единицы сумм, идемпотентность, возвраты,
-                          условия измерения НФТ, хранение данных, покрытие приёмкой): правила + LLM (agents/iso_domain.py);
+  6. Domain Critic      — чек-лист предметной области (время и часовой пояс, единицы сумм и округление, идемпотентность,
+                          возвраты, НФТ, хранение данных, роли, коды ошибок и методы API, приёмка): правила + LLM
+                          (agents/iso_domain.py); второй LLM-проход Scenario Critic ищет пропущенные роли и сценарии
+                          (prompts/iso_scenario.md);
   7. Grounding Verifier — каждая цитата ищется в документе; неподтверждённые претензии отбрасываются;
   8. Verdict            — сводка, критичные дефекты (непроверяемые/противоречивые/неполные) и итог.
 Без LLM работают правила (шаги 1, 2, 6), верификатор и вердикт — отчёт строится всегда.
@@ -191,7 +193,7 @@ def rule_review(u: ReqUnit) -> list[Issue]:
     sents = _sentences(t)
     if u.kind in REQ_KINDS and len(sents) >= 2 and u.kind != "business":
         sev = "major" if len(sents) >= 3 else "minor"
-        out.append(_issue("singular", sev, f"В одном пункте {len(sents)} самостоятельных утверждения — их нельзя "
+        out.append(_issue("singular", sev, f"Требование не атомарно: в одном пункте несколько ({len(sents)}) самостоятельных утверждений — их нельзя "
                           f"независимо реализовать, протестировать и проследить.", u, _first_words(sents[1], 12),
                           "Разбить на отдельные требования с собственными ID (по одному правилу на пункт)."))
     # прослеживаемость: нет уникального идентификатора
@@ -597,12 +599,22 @@ async def _run(doc: Document, cfg: LLMConfig, use_llm: bool, on_event=None) -> t
                 stats["notes"].append(f"доменный критик: {str(e)[:120]}")
                 return []
 
-        results = await asyncio.gather(*(one(b) for b in batches), set_task(), contra_task(), domain_task())
-        for r in results[:-3]:
+        async def scenario_task():
+            stats["llm_calls"] += 1
+            hints = [f"- набор: [{i.agent.split(':')[-1]}] {i.problem[:160]}" for i in dom_set]
+            try:
+                return await iso_domain.llm_findings(client, doc, seg, hints, stats, prompt="iso_scenario")
+            except Exception as e:
+                stats["llm_failed"] += 1
+                stats["notes"].append(f"критик сценариев: {str(e)[:120]}")
+                return []
+
+        results = await asyncio.gather(*(one(b) for b in batches), set_task(), contra_task(), domain_task(), scenario_task())
+        for r in results[:-4]:
             llm_reviews.update(r)
-        raw_set = results[-3]
-        contra_raw = results[-2] or []
-        domain_raw = results[-1] or []
+        raw_set = results[-4]
+        contra_raw = results[-3] or []
+        domain_raw = (results[-2] or []) + (results[-1] or [])
         used = getattr(client, "used_models", None)
         if isinstance(used, dict) and used:
             # честный паспорт: все модели, которые реально ответили (основная первой), с числом ответов
@@ -913,7 +925,7 @@ def review_document(doc: Document, cfg: LLMConfig | None = None, use_llm: bool =
                {"agent": "Set Critic (LLM)", "result": "выполнено" if sr.mode == "llm" else "не выполнено — использованы правила"},
                {"agent": "Contradiction Hunter (LLM)", "result": f"противоречий в наборе: "
                                                                  f"{sum(1 for i in sr.issues if i.characteristic == 'set_consistent')}"},
-               {"agent": "Domain Critic (правила + LLM)", "result": f"доменных находок в отчёте: "
+               {"agent": "Domain + Scenario Critic (правила + LLM)", "result": f"доменных находок в отчёте: "
                                                                     f"{sum(1 for u in units for i in u.issues if i.agent) + sum(1 for i in sr.issues if i.agent)}"},
                {"agent": "Grounding Verifier", "result": f"отклонено неподтверждённых претензий: {stats['rejected']}"}],
     )

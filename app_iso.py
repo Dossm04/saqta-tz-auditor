@@ -14,8 +14,8 @@ from report_iso import to_markdown
 AGENTS = [
     ("segmenter", "Segmenter", "Нарезка документа на требования с ID из документа или производными ID и цитатами"),
     ("rules", "Rule Checker", "Правила по каждой характеристике: размытость, TBD, пустые поля, единичность, API, противоречия"),
-    ("domain", "Domain Critic", "Финтех-чек-лист: часовой пояс, единицы сумм, идемпотентность, возвраты, НФТ, хранение, приёмка"),
-    ("llm", "LLM-критики", "Requirement Critic ‖ Set Critic ‖ Contradiction Hunter ‖ Domain Critic — параллельно"),
+    ("domain", "Domain Critic", "Чек-лист области: время, суммы и округление, идемпотентность, возвраты, роли, коды ошибок API, приёмка; Scenario Critic ищет пропущенные сценарии"),
+    ("llm", "LLM-критики", "Requirement Critic ‖ Set Critic ‖ Contradiction Hunter ‖ Domain Critic ‖ Scenario Critic — параллельно"),
     ("verifier", "Grounding Verifier", "Каждая цитата ищется в документе; претензии без подтверждения отбрасываются"),
 ]
 

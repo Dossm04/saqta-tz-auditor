@@ -43,6 +43,9 @@ TOPIC_KW = {
     "placeholder": ("не заполн", "позже", "открыт", "перечн", "тариф"),
     "terms": ("не определ", "порог", "термин", "крупн", "значительн"),
     "api": ("curl", "метод", "статус", "код", "пример"),
+    "roles": ("роль", "роли", "прав", "доступ", "кто может"),
+    "limits": ("значени", "лимит", "максимум", "минимум", "ограничени"),
+    "scenario": ("сценари", "истечени", "одновремен", "недоступн", "не найден", "отмен"),
 }
 
 # ── безопасность API и уведомлений ─────────────────────────────────────────────
@@ -379,6 +382,14 @@ def set_rules(seg: Segmentation, doc: Document) -> list:
                 "Добавить сценарии приёмки на каждое правило, включая граничные значения и отрицательные случаи.",
                 related=list(dict.fromkeys(rel + [u.rid for u in acc])), lines=sorted({l for u in acc for l in u.lines})))
     issues += _api_set_rules(seg, doc)
+    issues += _coverage_rules(seg, doc)
+    from agents import api_generic
+
+    def mk(code, sev, topic, problem, evidence, fix, lines):
+        rel = list(dict.fromkeys(u.rid for l in lines for u in [seg.unit_for_line(l)] if u))
+        return _mk(code, sev, topic, problem, None, evidence, fix, related=rel, lines=lines)
+    issues += api_generic.api_issues(doc, mk)
+    issues += api_generic.limit_conflicts(doc, mk)
     return issues
 
 
@@ -419,18 +430,208 @@ def _api_set_rules(seg: Segmentation, doc: Document) -> list:
     return issues
 
 
+# ── покрытие: коды ошибок, статусы, роли, округление, методы, сроки ────────────
+
+_ACTOR = re.compile(r"\b(администратор\w*|оператор\w*|регистратор\w*|врач\w*|учител\w*|родител\w*|ученик\w*|завуч\w*|модератор\w*|"
+                    r"менеджер\w*|сотрудник\w*|кассир\w*|пациент\w*|основн\w+\s+держател\w*|дополнительн\w+\s+карт\w*|"
+                    r"доверенн\w+\s+лиц\w*|опекун\w*|супервайзер\w*|бухгалтер\w*)", re.I)
+_ROLE_DEF = re.compile(r"роли\b|ролев|права\s+доступа|матриц\w*\s+(?:прав|доступ)|разграничени\w*\s+доступ", re.I)
+_PCT_CALC = re.compile(r"\d+(?:[.,]\d+)?\s*%|процентн\w*\s+ставк|ставк\w*\s+(?:вознагражд|по\s+депозит|\d)|кешб[эе]к|комисси\w*|"
+                       r"начислени\w*\s+(?:процент|вознагражд)|\bпен[ия]\b|штраф|неустойк|капитализац", re.I)
+_ROUND = re.compile(r"округл|rounding|до\s+(?:целого|тиын|копе|двух\s+знаков)|точност\w*\s+до", re.I)
+_STATUS_TOK = re.compile(r"\b([A-Z][A-Z]+(?:_[A-Z]+)*)\b")
+_STATUS_CTX = re.compile(r"статус|status|state|состояни", re.I)
+_NOT_STATUS = {"REST", "HTTP", "HTTPS", "JSON", "CURL", "UUID", "ISO", "PATCH", "POST", "GET", "PUT", "DELETE", "UTC", "GMT", "KZT",
+               "USD", "API", "URL", "SMS", "PUSH", "PDF", "CSV", "XLSX", "MCC", "PAN", "CVV", "OTP", "JIRA", "BPMN", "UI", "UX", "ID",
+               "IIN", "AML", "SLA", "TBD", "DB", "NFR", "OK", "TRUE", "FALSE", "NULL", "SSO", "CRM", "ABS", "ESB", "BASE",
+               "TOKEN", "IBAN", "BIC", "SWIFT", "EUR", "RUB", "MS", "RPS", "TPS", "BEARER", "DATE", "TIME", "XML", "SQL", "FAQ"}
+# действие в части A → как его ищем среди методов API
+_LIFECYCLE = [
+    ("отмена", re.compile(r"\bотмен\w*", re.I), re.compile(r"cancel|отмен|DELETE", re.I)),
+    ("разморозка", re.compile(r"разморо\w*|разблокир\w*", re.I), re.compile(r"unfreeze|unblock|разморо|разблок|activat", re.I)),
+    ("расторжение / закрытие", re.compile(r"расторж\w*|досрочн\w+\s+закрыт\w*|закрыти\w+\s+(?:депозит|вклад|сч[её]т)", re.I),
+     re.compile(r"terminat|close|расторж|закрыт|DELETE", re.I)),
+    ("перенос", re.compile(r"\bперен[её]с\w*|перенести", re.I), re.compile(r"reschedul|перенос|перенест|PATCH|PUT", re.I)),
+    ("отключение / удаление", re.compile(r"\bотключ\w*\s+(?:автоплат|подписк|услуг)|удалени\w+\s+(?:автоплат|шаблон|подписк)", re.I),
+     re.compile(r"DELETE|disable|отключ|удал|remove", re.I)),
+    ("редактирование", re.compile(r"(?:изменени\w*|редактирова\w*|исправлени\w*)\s+(?:оценк|записи|параметр|суммы|шаблон|автоплат)", re.I),
+     re.compile(r"PATCH|PUT|update|edit|измен|редакт", re.I)),
+]
+_TIME_FACT = re.compile(r"(?:не позднее|не более|в течение|в пределах|за|до)\s+(\d+(?:[.,]\d+)?)\s*"
+                        r"(мс|миллисекунд\w*|секунд\w*|сек\b|минут\w*|мин\b|час\w*)", re.I)
+_STOP_STEMS = {"требова", "систем", "клиента", "клиенто", "операци", "должна", "должен", "сервиса", "пользов", "приложе", "выполня",
+               "результ", "обработ", "запроса", "ответа", "времени", "секунды", "секунд", "минуты", "течение", "позднее", "момента",
+               "получен", "отправл", "уведомл"}
+
+
+def _secs(num: str, unit: str) -> float:
+    v = float(num.replace(",", "."))
+    u = unit.lower()
+    return v / 1000 if u.startswith(("мс", "милли")) else v * 60 if u.startswith("мин") else v * 3600 if u.startswith("час") else v
+
+
+def _stems(text: str) -> set[str]:
+    return {w[:7] for w in re.findall(r"[а-яё]{7,}", _norm(text))} - _STOP_STEMS
+
+
+def _coverage_rules(seg: Segmentation, doc: Document) -> list:
+    issues = []
+    units = seg.units
+    iface = [u for u in units if u.kind in ("interface", "api_logic")]
+    part_a = [u for u in units if u.kind not in ("interface", "api_logic", "meta", "checklist", "testing")]
+    full = _norm(doc.text)
+
+    # 1. коды ответа: нет 404 / 403 / 5xx / 400 при наличии перечня кодов
+    listed = {}
+    for u in units:
+        m = re.search(r"код (\d{3})", u.doc_ref)
+        if m:
+            listed.setdefault(m.group(1), u)
+    from agents import api_generic
+    for code, ln in api_generic.response_codes(doc).items():
+        u = seg.unit_for_line(ln)
+        if u and u.kind in ("interface", "api_logic"):
+            listed.setdefault(code, u)
+    if listed:
+        api_text = " ".join(u.text for u in iface)
+        need = []
+        has_id = bool(re.search(r"\{\w+\}|Path-параметр|Parameter:\s*\w*(?:id|Id|ID)\b|phone|телефон|\biin\b|\bиин\b", api_text))
+        if has_id and "404" not in listed and not re.search(r"\b404\b|не найден", api_text, re.I):
+            need.append("объект не найден (404)")
+        if "403" not in listed and not re.search(r"\b403\b|нет прав|доступ запрещ", api_text, re.I):
+            need.append("нет прав на объект или действие (403)")
+        if not any(c.startswith("5") for c in listed) and not re.search(r"\b5\d\d\b", api_text):
+            need.append("сбой или недоступность смежной системы (5xx)")
+        if not any(c in listed for c in ("400", "422")) and re.search(r"Mandatory:\s*Да|обязательн", api_text, re.I):
+            need.append("некорректные или отсутствующие параметры (400/422)")
+        if len(need) >= 2 or (need and need[0].startswith("объект")):
+            lu = list(listed.values())
+            issues.append(_mk("set_complete", "major", "api",
+                              "В перечне кодов ответа не описаны ошибки: " + "; ".join(need) +
+                              ". Поведение системы в этих случаях не определено, тестировщику нечего проверять.",
+                              lu[0], [lu[0].quote.strip("| ")[:60]],
+                              "Добавить в перечень коды ошибок с условием возникновения, текстом и примером ответа.",
+                              related=[u.rid for u in lu[:4]], lines=sorted({l for u in lu for l in u.lines[:1]})))
+
+    # 2. статусы объекта в части A и в API различаются
+    def status_tokens(us):
+        out = {}
+        for u in us:
+            if not _STATUS_CTX.search(u.text):
+                continue
+            for t in _STATUS_TOK.findall(u.text):
+                if len(t) >= 4 and t not in _NOT_STATUS:
+                    out.setdefault(t, u)
+        return out
+    sa, sb = status_tokens(part_a), status_tokens(iface)
+    only_a, only_b = sorted(set(sa) - set(sb)), sorted(set(sb) - set(sa))
+    if sa and sb and only_a and only_b:
+        ua, ub = sa[only_a[0]], sb[only_b[0]]
+        issues.append(_mk("set_consistent", "critical", "api",
+                          f"Статусы в требованиях ({', '.join(only_a[:4])}) не совпадают со статусами в API ({', '.join(only_b[:4])}): "
+                          "непонятно, какое значение хранить и возвращать.", ua,
+                          [_snip(ua.text, re.search(only_a[0], ua.text)), _snip(ub.text, re.search(only_b[0], ub.text))],
+                          "Завести единый справочник статусов и использовать его в требованиях, API и примерах.",
+                          related=[ua.rid, ub.rid], lines=sorted(set(ua.lines[:1] + ub.lines[:1]))))
+
+    # 3. несколько ролей / участников, но права доступа не описаны
+    actors = {}
+    for u in units:
+        for m in _ACTOR.finditer(u.text):
+            actors.setdefault(_norm(m.group(1))[:6], (u, m))
+    if len(actors) >= 2 and not _ROLE_DEF.search(full):
+        vals = list(actors.values())
+        (u0, m0), (u1, m1) = vals[:2]
+        names = ", ".join(_norm(m.group(1)) for _, m in vals[:5])
+        issues.append(_mk("set_complete", "major", "roles",
+                          f"В документе несколько участников ({names}), но не описано, кто какие действия может выполнять: "
+                          "нет ролей и прав доступа. Неясно, кому разрешена каждая операция и что видят остальные.",
+                          u0, [_snip(u0.text, m0), _snip(u1.text, m1)],
+                          "Добавить раздел «Роли и права доступа»: матрица «роль — действие — разрешено/запрещено».",
+                          related=list(dict.fromkeys([u0.rid, u1.rid])), lines=sorted(set(u0.lines[:1] + u1.lines[:1]))))
+
+    # 4. расчёт процентов / комиссий / кешбэка без правила округления
+    if not _ROUND.search(full) and _MAJOR_UNIT.search(doc.text):
+        calc = next(((u, m) for u in part_a if u.kind in ("functional", "business_rule")
+                     for m in [_PCT_CALC.search(u.text)] if m), None)
+        if calc:
+            u, m = calc
+            issues.append(_mk("unambiguous", "major", "money",
+                              "Сумма рассчитывается (процент, ставка, комиссия или кешбэк), но не задано правило округления и "
+                              "база расчёта: результат может отличаться на тиын у разных систем.",
+                              u, [_snip(u.text, m)],
+                              "Указать базу расчёта, точность (до тиына), способ округления (математическое, вниз) и момент округления.",
+                              related=[u.rid]))
+
+    # 5. действие из части A, для которого в API нет метода
+    if any(u.kind == "interface" for u in units):
+        api_text = " ".join(u.text for u in iface)
+        miss = []
+        for name, a_rx, api_rx in _LIFECYCLE:
+            src = next((u for u in part_a if u.kind in ("functional", "business_rule", "ui", "process") and a_rx.search(u.text)), None)
+            if src and not api_rx.search(api_text):
+                miss.append((name, src, a_rx.search(src.text)))
+        if miss:
+            u0 = miss[0][1]
+            issues.append(_mk("set_complete", "major", "api",
+                              "В требованиях есть действия, для которых в спецификации API нет метода: " +
+                              "; ".join(f"{n} ({u.doc_ref})" for n, u, _ in miss[:4]) + ". Реализовать их по документу нельзя.",
+                              u0, [_snip(u.text, m) for _, u, m in miss[:2]],
+                              "Описать методы API для этих действий (URL, метод, параметры, коды ответа) или указать, что они вне объёма.",
+                              related=[u.rid for _, u, _ in miss[:4]], lines=sorted({l for _, u, _ in miss[:4] for l in u.lines[:1]})))
+
+    # 5б. время суток без часового пояса (при этом во всём документе пояс не указан)
+    if not _TZ.search(full):
+        hit = next(((u, m) for u in part_a if u.kind in ("functional", "business_rule", "nonfunctional", "data")
+                    for m in [re.search(r"(?<![\d:])(?:[01]?\d|2[0-3]):[0-5]\d(?![\d:])", u.text)] if m), None)
+        if hit:
+            u, m = hit
+            issues.append(_mk("unambiguous", "major", "time",
+                              f"Время «{m.group(0)}» указано без часового пояса, а в документе пояс нигде не задан: сервер, "
+                              "приложение и смежные системы могут считать границу по-разному.",
+                              u, [_snip(u.text, m)], "Указать часовой пояс (например, UTC+5) и хранить время в UTC со смещением.",
+                              related=[u.rid]))
+
+    # 6. один и тот же срок задан разными значениями в разных местах
+    facts = []
+    for u in units:
+        if u.kind not in ("functional", "business_rule", "nonfunctional"):   # цели и пояснения — не обязательства
+            continue
+        for m in _TIME_FACT.finditer(u.text):
+            facts.append((u, m, _secs(m.group(1), m.group(2)), _stems(u.text)))
+    pairs = 0
+    for i, (ua, ma, va, sa_) in enumerate(facts):
+        if pairs >= 3:
+            break
+        for ub, mb, vb, sb_ in facts[i + 1:]:
+            if ua.rid == ub.rid or va == vb or max(va, vb) > 20 * min(va, vb):   # разный масштаб — разные процессы
+                continue
+            common = sa_ & sb_
+            if len(common) >= 2 or (common and (ua.kind == "nonfunctional") != (ub.kind == "nonfunctional")):
+                pairs += 1
+                issues.append(_mk("set_consistent", "major", "time",
+                                  f"Для одного действия заданы разные сроки: «{ma.group(0)}» ({ua.doc_ref}) и «{mb.group(0)}» ({ub.doc_ref}). "
+                                  "Неясно, какой срок проверять при приёмке.",
+                                  ua, [_snip(ua.text, ma), _snip(ub.text, mb)],
+                                  "Оставить одно значение срока и сослаться на него из остальных разделов.",
+                                  related=[ua.rid, ub.rid], lines=sorted(set(ua.lines[:1] + ub.lines[:1]))))
+                break
+    return issues
+
+
 # ── LLM-агент ─────────────────────────────────────────────────────────────────
 
 class _RawDomain(BaseModel):
     findings: list[dict[str, Any]] = Field(default_factory=list)
 
 
-async def llm_findings(client, doc: Document, seg: Segmentation, rule_hints: list[str], stats: dict) -> list[dict]:
+async def llm_findings(client, doc: Document, seg: Segmentation, rule_hints: list[str], stats: dict,
+                       prompt: str = "iso_domain") -> list[dict]:
     # таблица требований содержит дословный текст каждого пункта — полный документ не дублируем (быстрее и дешевле)
     table = "\n".join(f"{u.rid} | {u.section} › {u.doc_ref} | {u.kind} | L{u.lines[0]} | {u.text}" for u in seg.units)
     user = (f"## Документ «{seg.title}»: требования (ID | раздел › место в документе | вид | строка | дословный текст)\n{table}\n\n"
             f"## Что уже нашли доменные правила (не повторяй, дополняй)\n" + ("\n".join(rule_hints) or "—"))
-    raw, tokens = await client.chat_json(load_prompt("iso_domain"), user, _RawDomain)
+    raw, tokens = await client.chat_json(load_prompt(prompt), user, _RawDomain)
     stats["tokens"] += tokens
     return raw.findings
 

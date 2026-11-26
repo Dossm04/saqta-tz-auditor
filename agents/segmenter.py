@@ -41,6 +41,9 @@ KINDS = [  # (подстрока заголовка, вид требования
     ("схема", "architecture"), ("цел", "business"), ("логика", "api_logic"), ("особые правила", "business_rule"),
     ("правил", "business_rule"), ("парамет", "interface"), ("request", "interface"), ("ответ", "interface"),
     ("статус", "interface"), ("общие параметры", "interface"), ("response", "interface"),
+    # спецификация API в произвольном оформлении (не по шаблону кейса)
+    ("api", "interface"), ("rest", "interface"), ("спецификац", "interface"), ("endpoint", "interface"),
+    ("эндпоинт", "interface"), ("метод", "interface"),
 ]
 KIND_LABEL = {
     "functional": "функциональное", "nonfunctional": "нефункциональное", "acceptance": "критерий приёмки",
@@ -258,6 +261,12 @@ def segment(doc: Document) -> Segmentation:
             kind_path = [h for _, h in path]
             is_param = any(k in " ".join(kind_path).lower() for k in ("парамет", "ответ", "общие параметры", "response"))
             suffix = f"параметр «{key}»" if is_param and key else f"строка {table_rows_seen}"
+            head0 = _clean(table_header[0]).lower() if table_header else ""
+            if re.fullmatch(r"[1-5]\d\d", key) and re.search(r"код|code|статус|status|http", head0):
+                suffix = f"код {key}"                       # таблица кодов ответа: «| 200 | Успешно |»
+            elif _EXPLICIT_ID.fullmatch(key + " ") or re.fullmatch(r"[A-ZА-ЯЁ]{1,6}(?:-[A-ZА-ЯЁ]{1,6})?[-‑–]\d+(?:\.\d+)*", key):
+                # строка таблицы требований с ID в первой колонке: «| НФ-1 | Время отклика ... |»
+                text = key + " " + "; ".join(_clean(c) for c in cells[1:] if _clean(c))
             add(text, line, [i], suffix)
             continue
         table_header = None

@@ -25,6 +25,9 @@ KIND_CHARS = {
     "incomplete": {"complete", "set_complete", "conforming", "missing"},
     "missing": {"set_complete", "complete", "missing"},
     "singular": {"singular"},
+    "not_atomic": {"singular"},
+    "unverifiable": {"verifiable", "set_verifiable", "unambiguous"},
+    "acceptance": {"set_verifiable", "set_complete", "set_consistent", "verifiable", "complete", "missing"},
     "ambiguity": {"unambiguous", "complete", "verifiable"},
     "verifiable": {"verifiable", "set_verifiable", "set_validatable", "unambiguous", "correct", "set_consistent"},
     "set": {"set_complete", "set_modifiable", "set_traceable", "set_verifiable", "set_ranked", "set_comprehensible",
@@ -87,7 +90,7 @@ def main() -> int:
         cfg = LLMConfig.from_env()
         files = sorted((ROOT / "eval" / "iso" / "blind").glob("*.json"))
         if a.split != "all":
-            files = [f for f in files if f.stem.startswith(a.split + "_")]
+            files = [f for f in files if f.stem.split("_")[0].rstrip("0123456789") == a.split]
         tf = tt = 0
         for f in files:
             exp = json.loads(f.read_text(encoding="utf-8"))
