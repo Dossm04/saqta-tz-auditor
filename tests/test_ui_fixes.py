@@ -386,7 +386,7 @@ def test_docs_numbers_match_knowledge_base():
     from knowledge.fintech_controls import CONTROLS
 
     n_ctrl, n_ap = len(CONTROLS), len(ANTIPATTERNS)
-    for name in ("README.md", "docs/PITCH.md"):
+    for name in ("README.md", "docs/PITCH_FINTECH.md"):
         t = (ROOT / name).read_text(encoding="utf-8")
         ctrl = {int(x) for x in re.findall(r"(\d+)\s+(?:\*\*)?(?:финтех/ИБ-)?контрол", t)}
         aps = {int(x) for x in re.findall(r"(\d+)\s+(?:\*\*)?тип\w* опасных требований", t)}
@@ -395,7 +395,7 @@ def test_docs_numbers_match_knowledge_base():
 
 
 def test_pitch_states_measured_v2_numbers_and_names_holdout_v2():
-    t = (ROOT / "docs" / "PITCH.md").read_text(encoding="utf-8")
+    t = (ROOT / "docs" / "PITCH_FINTECH.md").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "балл растёт, критичные → 0" not in t        # вместо обещания — измеренные числа
     m = re.search(r"балл (\d+) → (\d+),\s*критичных (\d+) → (\d+)", t)

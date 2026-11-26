@@ -123,7 +123,8 @@ class LLMConfig:
             max_doc_chars=int(os.getenv("LLM_MAX_DOC_CHARS", "80000")),
             fallback_models=tuple(m.strip() for m in fallbacks.split(",") if m.strip()),
             max_concurrency=int(os.getenv("LLM_MAX_CONCURRENCY", "3")),
-            call_budget_s=float(os.getenv("LLM_CALL_BUDGET", "150")),
+            # бюджет не короче полутора таймаутов: после одного таймаута остаётся время на запасную модель
+            call_budget_s=max(float(os.getenv("LLM_CALL_BUDGET", "150")), 1.5 * float(os.getenv("LLM_TIMEOUT", "180"))),
             cache=_bool(os.getenv("LLM_CACHE"), True),
             privacy=_privacy_mode(os.getenv("LLM_PRIVACY")),
         )

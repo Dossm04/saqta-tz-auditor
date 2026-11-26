@@ -7,9 +7,12 @@
                           согласованность статусов API, семантика HTTP-методов);
   3. Requirement Critic — LLM оценивает каждое требование пакетами по 10 характеристикам + риски ИБ;
   4. Set Critic         — LLM оценивает набор: противоречия, пропуски, чек-лист документа, вопросы автору;
-  5. Grounding Verifier — каждая цитата ищется в документе; неподтверждённые претензии отбрасываются;
-  6. Verdict            — сводка, критичные дефекты (непроверяемые/противоречивые/неполные) и итог.
-Без LLM работают шаги 1, 2, 5, 6 — отчёт строится всегда.
+  5. Contradiction Hunter — LLM ищет пары взаимоисключающих требований;
+  6. Domain Critic      — доменный чек-лист финтеха (время и часовой пояс, единицы сумм, идемпотентность, возвраты,
+                          условия измерения НФТ, хранение данных, покрытие приёмкой): правила + LLM (agents/iso_domain.py);
+  7. Grounding Verifier — каждая цитата ищется в документе; неподтверждённые претензии отбрасываются;
+  8. Verdict            — сводка, критичные дефекты (непроверяемые/противоречивые/неполные) и итог.
+Без LLM работают правила (шаги 1, 2, 6), верификатор и вердикт — отчёт строится всегда.
 """
 from __future__ import annotations
 
@@ -44,6 +47,7 @@ class Issue(BaseModel):
     related: list[str] = Field(default_factory=list)      # ID требований (R-xx)
     fix: str = ""
     source: str = "rules"                                  # rules | llm | rules+llm
+    agent: str = ""                                        # "domain:<тема>" для находок Domain Critic
 
 
 class UnitReview(BaseModel):
@@ -251,6 +255,47 @@ def api_set_rules(seg: Segmentation, doc: Document) -> list[Issue]:
                            ev_nobody.group(0).strip() if ev_nobody else _first_words(nobody.text, 4)],
                           "Либо передавать параметры в теле (application/json), либо убрать Content-Type.",
                           related=list(dict.fromkeys([ct.rid, nobody.rid])), lines=sorted(set(ct.lines + nobody.lines))))
+    # один и тот же параметр в запросе и ответе описан разными типами
+    params: dict[str, list[tuple[ReqUnit, str]]] = {}
+    for u in iface:
+        m = re.match(r"Parameter:\s*`?([\w.-]+)`?;\s*Format:\s*([^;]+)", u.text)
+        if m:
+            params.setdefault(m.group(1).lower(), []).append((u, m.group(2).strip().lower()))
+    for name, occ in params.items():
+        fmts = {f for _, f in occ}
+        if len(fmts) > 1 and len({u.section for u, _ in occ}) > 1:
+            (a, fa), (b, fb) = occ[0], next(x for x in occ if x[1] != occ[0][1])
+            out.append(_issue("set_consistent", "major",
+                              f"Параметр «{name}» в разных местах спецификации имеет разный тип: {fa} ({a.doc_ref}) и {fb} ({b.doc_ref}). "
+                              f"Клиент не сможет одинаково разобрать запрос и ответ.", a,
+                              [a.quote.strip('| ')[:70], b.quote.strip('| ')[:70]],
+                              f"Выбрать один тип для «{name}» (например, integer) и использовать его в запросе, ответе и примерах.",
+                              related=[a.rid, b.rid], lines=sorted(set(a.lines + b.lines))))
+    # ошибка валидации со статусом 200 при описанном 400
+    has_400 = any(re.search(r"код 400(?!, пример)", u.doc_ref) for u in units)
+    err200 = [u for u in iface if re.search(r"код 200", u.doc_ref)
+              and any(re.search(r"\"?result\"?\s*:\s*\"?error", doc.line(l), re.I) for l in u.lines)]
+    err_logic = [u for u in units if u.kind == "api_logic" and re.search(r"\bERROR\b", u.text)]
+    if has_400 and (err200 or err_logic):
+        src = (err200 or err_logic)[0]
+        ln = next((l for l in src.lines if re.search(r"error", doc.line(l), re.I)), src.lines[0])
+        rel = list(dict.fromkeys([src.rid] + [u.rid for u in err_logic[:1]] +
+                                 [u.rid for u in units if re.search(r"код 400(?!, пример)", u.doc_ref)][:1]))
+        out.append(_issue("set_consistent", "major",
+                          "Ошибка проверки суммы возвращается со статусом 200 и result=ERROR, хотя для неверно заполненных параметров "
+                          "описан статус 400. Клиент не сможет по коду ответа понять, сохранилась ли настройка.", src,
+                          [doc.line(ln).strip().strip("`")[:80]], "Возвращать 400 с описанием ошибки; 200 — только при успешном сохранении.",
+                          related=rel, lines=[ln]))
+    # документ требует чтения, а в спецификации описан только метод изменения
+    readers = [u for u in units if u.kind in ("integration", "functional") and re.search(r"\bчита\w*|\bполуча\w* настро", u.text, re.I)]
+    methods = [u for u in iface if re.search(r"rest type|http method|метод запроса", u.text, re.I)]
+    if readers and len(methods) == 1 and url_u and _STATE_CHANGE.search(url_u.text + (desc_u.text if desc_u else "")):
+        r = readers[0]
+        out.append(_issue("set_complete", "major",
+                          f"{r.doc_ref} требует, чтобы приложение читало настройки, но в спецификации API описан только метод сохранения "
+                          f"({_first_words(url_u.text.replace('Поле: ', ''), 6)}). Метода чтения нет — экран нельзя заполнить текущими значениями.",
+                          r, [_first_words(r.text, 9)], "Описать отдельный метод чтения (GET) с параметрами и ответом.",
+                          related=[r.rid, url_u.rid], lines=sorted(set(r.lines + url_u.lines))))
     return out
 
 
@@ -410,8 +455,23 @@ async def _llm_set(client, doc: Document, seg: Segmentation, rule_issues: list[I
 
 def _merge_issue_lists(rule: list[Issue], llm: list[Issue]) -> list[Issue]:
     """Дубли «правило + LLM» про одну характеристику и одну строку склеиваются; текст берётся у LLM."""
+    from agents.iso_domain import TOPIC_KW
+
     out = list(llm)
     for r in rule:
+        if r.agent.startswith("domain:"):
+            # доменная находка склеивается только с находкой LLM на ту же тему (а не с любой по той же характеристике)
+            kws = TOPIC_KW.get(r.agent.split(":", 1)[1], ())
+            dup = next((x for x in out if x.source != "rules" and (set(x.lines) & set(r.lines) or not r.lines)
+                        and (x.agent == r.agent or any(k in (x.problem + x.fix).lower().replace("ё", "е") for k in kws))), None)
+            if dup:
+                dup.source = "rules+llm"
+                dup.agent = dup.agent or r.agent
+                if dup.severity != r.severity and SEV_RANK.get(r.severity, 1) < SEV_RANK.get(dup.severity, 1):
+                    dup.severity = r.severity
+                continue
+            out.append(r)
+            continue
         dup = next((x for x in out if x.characteristic == r.characteristic and (set(x.lines) & set(r.lines) or not r.lines)), None)
         if dup:
             if dup.source == "llm":
@@ -463,9 +523,22 @@ async def _run(doc: Document, cfg: LLMConfig, use_llm: bool, on_event=None) -> t
     set_issues_rules, _ = set_rules(seg, doc)
     emit("rules", "done", f"сигналов: {sum(len(v) for v in rule_issues.values()) + len(set_issues_rules)}")
 
+    # Domain Critic: доменные правила (время, деньги, идемпотентность, возвраты, НФТ, данные, приёмка)
+    from agents import iso_domain
+
+    emit("domain", "start")
+    dom_units = iso_domain.unit_rules(seg, doc)
+    dom_set = iso_domain.set_rules(seg, doc)
+    for rid, items in dom_units.items():
+        rule_issues[rid] += items
+    set_issues_rules += dom_set
+    n_dom_rules = sum(len(v) for v in dom_units.values()) + len(dom_set)
+    stats["domain_rules"] = n_dom_rules
+
     llm_reviews: dict[str, dict] = {}
     raw_set: _RawSet | None = None
     contra_raw: list[dict] = []
+    domain_raw: list[dict] = []
     model_used = "офлайн-правила"
     if use_llm and cfg.enabled:
         client = LLMClient(cfg)
@@ -506,17 +579,60 @@ async def _run(doc: Document, cfg: LLMConfig, use_llm: bool, on_event=None) -> t
                 stats["notes"].append(f"поиск противоречий: {str(e)[:120]}")
                 return []
 
-        results = await asyncio.gather(*(one(b) for b in batches), set_task(), contra_task())
-        for r in results[:-2]:
+        async def domain_task():
+            stats["llm_calls"] += 1
+            hints = [f"- {rid}: [{i.agent.split(':')[-1]}] {i.problem[:160]}" for rid, items in dom_units.items() for i in items] + \
+                    [f"- набор: [{i.agent.split(':')[-1]}] {i.problem[:160]}" for i in dom_set]
+            try:
+                return await iso_domain.llm_findings(client, doc, seg, hints, stats)
+            except Exception as e:
+                stats["llm_failed"] += 1
+                stats["notes"].append(f"доменный критик: {str(e)[:120]}")
+                return []
+
+        results = await asyncio.gather(*(one(b) for b in batches), set_task(), contra_task(), domain_task())
+        for r in results[:-3]:
             llm_reviews.update(r)
-        raw_set = results[-2]
-        contra_raw = results[-1] or []
+        raw_set = results[-3]
+        contra_raw = results[-2] or []
+        domain_raw = results[-1] or []
         model_used = getattr(client, "active_model", cfg.model)
         emit("llm", "done", f"вызовов {stats['llm_calls']}, неуспешных {stats['llm_failed']}")
 
     # сборка по требованиям с заземлением цитат
     emit("verifier", "start")
     rids = {u.rid for u in seg.units}
+    # находки Domain Critic (LLM) — с заземлением цитат
+    dom_llm_unit: dict[str, list[Issue]] = {}
+    dom_llm_set: list[Issue] = []
+    dom_questions: list[dict] = []
+    for f in domain_raw:
+        if not isinstance(f, dict):
+            continue
+        ev = f.get("evidence") or []
+        ev = [ev] if isinstance(ev, str) else [str(x) for x in ev]
+        good, lines = _ground(doc, ev)
+        if not good:
+            stats["rejected"] += 1
+            continue
+        code = str(f.get("characteristic", "")).strip()
+        topic = str(f.get("topic", "")).strip() or iso_domain.topic_of(str(f.get("problem", "")))
+        rid = str(f.get("rid", "")).strip()
+        issue = Issue(characteristic=code, severity=_norm_sev(f.get("severity")), problem=str(f.get("problem", "")).strip()[:700],
+                      evidence=good, lines=lines, fix=str(f.get("fix", "")).strip()[:600], source="llm", agent=f"domain:{topic}")
+        if rid in rids and code in INDIVIDUAL_CODES:
+            dom_llm_unit.setdefault(rid, []).append(issue)
+        else:
+            if code not in SET_CODES:
+                issue.characteristic = "set_complete" if code in ("complete", "feasible") else "set_consistent" \
+                    if code == "correct" else "set_verifiable" if code == "verifiable" else "set_complete"
+            issue.related = [rid] if rid in rids else []
+            dom_llm_set.append(issue)
+        q = str(f.get("question", "")).strip()
+        if q:
+            dom_questions.append({"question": q[:300], "related": [rid] if rid in rids else [], "options": [issue.fix] if issue.fix else [],
+                                  "addressee": "Аналитик / владелец продукта"})
+    emit("domain", "done", f"доменных находок: правила {n_dom_rules}, LLM {sum(map(len, dom_llm_unit.values())) + len(dom_llm_set)}")
     unit_reviews: list[UnitReview] = []
     pages = getattr(doc, "line_pages", None)
     for u in seg.units:
@@ -543,12 +659,12 @@ async def _run(doc: Document, cfg: LLMConfig, use_llm: bool, on_event=None) -> t
                                         problem=str(it.get("problem", "")).strip()[:600], evidence=good, lines=lines,
                                         related=rel, fix=str(it.get("fix", "")).strip()[:600], source="llm"))
             rewrite = str(llm.get("rewrite") or "").strip()[:800]
-        rule_ = [] if llm is None else []
+        llm_issues += dom_llm_unit.get(u.rid, [])
         merged = _merge_issue_lists(rule_issues[u.rid], llm_issues)
-        # rules в LLM-режиме: оставляем только сигналы, которые LLM не опроверг явным «ok» (кроме ИБ и TBD)
+        # rules в LLM-режиме: оставляем только сигналы, которые LLM не опроверг явным «ok» (кроме ИБ, TBD и доменных)
         if llm_statuses:
             merged = [i for i in merged if i.source != "rules" or llm_statuses.get(i.characteristic) != "ok"
-                      or i.characteristic in ("security", "complete")]
+                      or i.characteristic in ("security", "complete") or i.agent.startswith("domain:")]
         st = _statuses_from(merged, INDIVIDUAL_CODES, llm_statuses, _na_for(u))
         explained = {i.characteristic for i in merged}
         for c, v in st.items():
@@ -605,9 +721,17 @@ async def _run(doc: Document, cfg: LLMConfig, use_llm: bool, on_event=None) -> t
         set_llm_issues.append(Issue(characteristic="set_consistent", severity=_norm_sev(c.get("severity")),
                                     problem=str(c.get("problem", "")).strip()[:700], evidence=good, lines=lines, related=rel,
                                     fix=str(c.get("fix", "")).strip()[:600], source="llm"))
+    set_llm_issues += dom_llm_set
     # правило-противоречия, которые LLM уже описал, склеиваются по пересечению требований
     merged_set = list(set_llm_issues)
     for r in set_issues_rules:
+        if r.agent.startswith("domain:"):
+            same = next((x for x in merged_set if x.agent == r.agent and x.source != "rules"), None)
+            if same:
+                same.source = "rules+llm"
+            else:
+                merged_set.append(r)
+            continue
         dup = next((x for x in merged_set if x.characteristic == r.characteristic and set(x.related) & set(r.related)
                     and (set(x.lines) & set(r.lines) or not r.lines)), None)
         if dup:
@@ -621,6 +745,13 @@ async def _run(doc: Document, cfg: LLMConfig, use_llm: bool, on_event=None) -> t
         if v == "issue" and not any(i.characteristic == c for i in sr.issues) and not sr.comments.get(c):
             sr.statuses[c] = "warn"
     sr.checklist = _complete_checklist(seg, sr)
+    seen_q = {q.get("question", "")[:60] for q in sr.questions}
+    for q in dom_questions:
+        if len(sr.questions) >= 18:
+            break
+        if q["question"][:60] not in seen_q:
+            sr.questions.append(q)
+            seen_q.add(q["question"][:60])
     if len(sr.questions) < 6:
         sr.questions += _fallback_questions(unit_reviews, sr, 8 - len(sr.questions))
     emit("verifier", "done", f"отклонено неподтверждённых претензий: {stats['rejected']}")
@@ -766,5 +897,7 @@ def review_document(doc: Document, cfg: LLMConfig | None = None, use_llm: bool =
                {"agent": "Set Critic (LLM)", "result": "выполнено" if sr.mode == "llm" else "не выполнено — использованы правила"},
                {"agent": "Contradiction Hunter (LLM)", "result": f"противоречий в наборе: "
                                                                  f"{sum(1 for i in sr.issues if i.characteristic == 'set_consistent')}"},
+               {"agent": "Domain Critic (правила + LLM)", "result": f"доменных находок в отчёте: "
+                                                                    f"{sum(1 for u in units for i in u.issues if i.agent) + sum(1 for i in sr.issues if i.agent)}"},
                {"agent": "Grounding Verifier", "result": f"отклонено неподтверждённых претензий: {stats['rejected']}"}],
     )

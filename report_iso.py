@@ -8,6 +8,10 @@ from agents.segmenter import KIND_LABEL
 from knowledge.iso29148 import BY_CODE, INDIVIDUAL, SECURITY, SET, SEVERITY_ICON, SEVERITY_LABEL, STATUS_ICON
 
 _STATUS_TEXT = {"ok": "соответствует", "issue": "нарушено", "warn": "замечание", "na": "не применимо"}
+DOMAIN_TOPICS = {"time": "время и часовой пояс", "money": "единицы сумм", "idempotency": "идемпотентность",
+                 "reversal": "возвраты", "nfr": "условия измерения НФТ", "retention": "хранение данных",
+                 "ui": "валидация ввода", "precondition": "условия применимости", "acceptance": "покрытие приёмкой",
+                 "security": "безопасность", "edge": "граничные случаи"}
 
 
 def _esc(s: str) -> str:
@@ -31,7 +35,11 @@ def _issue_md(i, idx: int) -> list[str]:
         out.append(f"   Связано: {', '.join(i.related)}")
     if i.fix:
         out.append(f"   **Исправить:** {i.fix}")
-    out.append(f"   _Источник: {'LLM-критик' if i.source == 'llm' else 'правила' if i.source == 'rules' else 'правила и LLM-критик'}_")
+    src = 'LLM-критик' if i.source == 'llm' else 'правила' if i.source == 'rules' else 'правила и LLM-критик'
+    if getattr(i, "agent", "").startswith("domain:"):
+        topic = DOMAIN_TOPICS.get(i.agent.split(":", 1)[1], i.agent.split(":", 1)[1])
+        src = f"доменный критик ({topic}), {src}"
+    out.append(f"   _Источник: {src}_")
     return out
 
 

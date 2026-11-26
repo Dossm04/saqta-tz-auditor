@@ -1,4 +1,4 @@
-name: CI
+﻿name: CI
 
 on:
   push:
@@ -24,4 +24,4 @@ jobs:
       - name: Hackathon case — one-command run on the case document (offline)
         run: |
           python validate.py examples/case_requirements.pdf reports/ci_report.md --offline
-          python scripts/eval_iso.py --min-recall 0.4
+          python scripts/eval_iso.py --min-recall 0.85
