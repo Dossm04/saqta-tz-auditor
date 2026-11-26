@@ -596,7 +596,13 @@ async def _run(doc: Document, cfg: LLMConfig, use_llm: bool, on_event=None) -> t
         raw_set = results[-3]
         contra_raw = results[-2] or []
         domain_raw = results[-1] or []
-        model_used = getattr(client, "active_model", cfg.model)
+        used = getattr(client, "used_models", None)
+        if isinstance(used, dict) and used:
+            # честный паспорт: все модели, которые реально ответили (основная первой), с числом ответов
+            order = sorted(used, key=lambda m: (m != cfg.model, -used[m]))
+            model_used = ", ".join(f"{m} ({used[m]})" if len(used) > 1 else m for m in order)
+        else:
+            model_used = getattr(client, "active_model", cfg.model)
         emit("llm", "done", f"вызовов {stats['llm_calls']}, неуспешных {stats['llm_failed']}")
 
     # сборка по требованиям с заземлением цитат

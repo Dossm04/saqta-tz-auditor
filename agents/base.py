@@ -113,6 +113,10 @@ class LLMClient:
         self.switches: list[str] = []             # журнал переключений моделей (для трассировки)
         self.transient_errors = 0
         self.cache_hits = 0
+        self.used_models: dict[str, int] = {}     # какие модели реально ответили в этом прогоне (вкл. ответы из кэша)
+
+    def _note_model(self, model: str) -> None:
+        self.used_models[model] = self.used_models.get(model, 0) + 1
 
     @property
     def active_model(self) -> str:
@@ -144,6 +148,11 @@ class LLMClient:
                     cache_file.unlink(missing_ok=True)
                 else:
                     self.cache_hits += 1          # считаем попадание только после успешной валидации
+                    side = cache_file.with_suffix(".model")
+                    try:
+                        self._note_model(side.read_text(encoding="utf-8").strip() or self.cfg.model)
+                    except OSError:
+                        self._note_model(self.cfg.model)
                     return result, 0
 
         messages: list[dict[str, str]] = [
@@ -231,9 +240,11 @@ class LLMClient:
             content = re.sub(r"<thought>.*?</thought>", "", content, flags=re.S).strip()  # Gemma и др. «думают» в тексте
             try:
                 result = schema.model_validate(extract_json(content))
+                self._note_model(model)
                 if cache_file is not None:
                     CACHE_DIR.mkdir(parents=True, exist_ok=True)
                     cache_file.write_text(content, encoding="utf-8")
+                    cache_file.with_suffix(".model").write_text(model, encoding="utf-8")
                 return result, usage[0]
             except (ValueError, TypeError, ValidationError) as e:
                 last_error = e
