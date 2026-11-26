@@ -36,3 +36,5 @@
  "checklist": [{"item": "…", "answer": "Нет", "comment": "…"}],
  "questions": [{"question": "…?", "related": ["R-06"], "options": ["…", "…"], "addressee": "Бизнес-заказчик"}],
  "summary": "…", "top_fixes": ["R-06, R-15: …"]}
+
+Все текстовые поля ответа (problem, fix, rewrite, summary, вопросы) пиши только по-русски, даже если в документе есть английские термины.

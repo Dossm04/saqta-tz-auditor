@@ -30,3 +30,5 @@
 
 Ответ — ТОЛЬКО JSON:
 {"reviews": [{"rid": "R-05", "statuses": {"necessary": "ok", "appropriate": "ok", "unambiguous": "issue", "complete": "issue", "singular": "ok", "feasible": "ok", "verifiable": "ok", "correct": "ok", "conforming": "ok", "traceable": "ok", "security": "ok"}, "issues": [{"characteristic": "complete", "severity": "major", "problem": "…", "evidence": "дословная цитата", "related": [], "fix": "…"}], "rewrite": "…"}]}
+
+Все текстовые поля ответа (problem, fix, rewrite, summary, вопросы) пиши только по-русски, даже если в документе есть английские термины.

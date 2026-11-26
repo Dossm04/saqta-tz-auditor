@@ -453,6 +453,11 @@ async def _llm_set(client, doc: Document, seg: Segmentation, rule_issues: list[I
     return raw
 
 
+def _is_russian(s: str) -> bool:
+    letters = [c for c in s if c.isalpha()]
+    return not letters or sum(1 for c in letters if "а" <= c.lower() <= "я" or c in "ёЁ") / len(letters) >= 0.4
+
+
 def _merge_issue_lists(rule: list[Issue], llm: list[Issue]) -> list[Issue]:
     """Дубли «правило + LLM» про одну характеристику и одну строку склеиваются; текст берётся у LLM."""
     from agents.iso_domain import TOPIC_KW
@@ -467,6 +472,8 @@ def _merge_issue_lists(rule: list[Issue], llm: list[Issue]) -> list[Issue]:
             if dup:
                 dup.source = "rules+llm"
                 dup.agent = dup.agent or r.agent
+                if not _is_russian(dup.problem):      # отчёт на русском: текст правила вместо ответа модели на другом языке
+                    dup.problem, dup.fix = r.problem, r.fix or dup.fix
                 if dup.severity != r.severity and SEV_RANK.get(r.severity, 1) < SEV_RANK.get(dup.severity, 1):
                     dup.severity = r.severity
                 continue
