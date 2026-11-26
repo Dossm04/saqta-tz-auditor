@@ -616,7 +616,9 @@ async def _run(doc: Document, cfg: LLMConfig, use_llm: bool, on_event=None) -> t
             stats["rejected"] += 1
             continue
         code = str(f.get("characteristic", "")).strip()
-        topic = str(f.get("topic", "")).strip() or iso_domain.topic_of(str(f.get("problem", "")))
+        topic = str(f.get("topic", "")).strip().lower()
+        if topic not in iso_domain.TOPIC_KW and topic not in ("security", "edge"):
+            topic = iso_domain.topic_of(str(f.get("problem", "")) + " " + str(f.get("fix", ""))) or "edge"
         rid = str(f.get("rid", "")).strip()
         issue = Issue(characteristic=code, severity=_norm_sev(f.get("severity")), problem=str(f.get("problem", "")).strip()[:700],
                       evidence=good, lines=lines, fix=str(f.get("fix", "")).strip()[:600], source="llm", agent=f"domain:{topic}")
