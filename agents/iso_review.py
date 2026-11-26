@@ -871,8 +871,9 @@ def agent_version() -> str:
     root = Path(__file__).resolve().parent.parent
     try:
         commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=root, capture_output=True, text=True, timeout=5).stdout.strip()
-        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=root, capture_output=True, text=True,
-                               timeout=5).stdout.strip()
+        # сами отчёты в reports/ — результат прогона, а не изменение кода агента
+        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no", "--", ".", ":(exclude)reports"], cwd=root,
+                               capture_output=True, text=True, timeout=5).stdout.strip()
         tag = subprocess.run(["git", "describe", "--tags", "--abbrev=0"], cwd=root, capture_output=True, text=True, timeout=5).stdout.strip()
         if commit:
             return f"{tag + ' · ' if tag else ''}коммит {commit}{' (+ локальные изменения)' if dirty else ''}"
