@@ -1,11 +1,11 @@
 {
   "document_name": "case_requirements.pdf",
   "document_title": "Уведомление о расходах по карте",
-  "run_at": "2026-11-27 00:46 (UTC+5)",
+  "run_at": "2026-11-27 00:47 (UTC+5)",
   "model": "gemini-flash-lite-latest (9), gemini-3.1-flash-lite (1)",
-  "agent_version": "коммит 669462f (+ локальные изменения)",
+  "agent_version": "коммит 3e99c5e",
   "mode": "LLM + правила",
-  "duration_s": 17.81,
+  "duration_s": 1.77,
   "units": [
     {
       "rid": "R-01",
@@ -3639,7 +3639,7 @@
     },
     "unit_issues": 87,
     "set_issues": 13,
-    "tokens": 37639,
+    "tokens": 0,
     "rejected": 5,
     "llm_calls": 10,
     "llm_failed": 0,
