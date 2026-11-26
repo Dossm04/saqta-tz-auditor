@@ -25,7 +25,7 @@ def _offline(monkeypatch):
 def _app():
     from streamlit.testing.v1 import AppTest
 
-    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=90)
+    at = AppTest.from_file(str(ROOT / "app_fintech.py"), default_timeout=90)
     at.session_state["app_mode"] = "Финтех-аудит ТЗ (повестка, ТЗ v2)"
     return at
 
@@ -297,10 +297,10 @@ def test_language_profile_of_samples_is_russian():
     """Ни один русскоязычный образец не должен получать предупреждение о языке."""
     import ast
 
-    src = (ROOT / "app.py").read_text(encoding="utf-8")
+    src = (ROOT / "app_fintech.py").read_text(encoding="utf-8")
     fn = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "_letters_profile")
     ns: dict = {}
-    exec(compile(ast.Module(body=[fn], type_ignores=[]), "app.py", "exec"), ns)
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "app_fintech.py", "exec"), ns)
     for p in sorted((ROOT / "samples").glob("*_tz.md")):
         latin, kaz = ns["_letters_profile"](p.read_text(encoding="utf-8"))
         assert latin <= 0.5 and kaz <= 0.02, p.name
@@ -386,7 +386,7 @@ def test_docs_numbers_match_knowledge_base():
     from knowledge.fintech_controls import CONTROLS
 
     n_ctrl, n_ap = len(CONTROLS), len(ANTIPATTERNS)
-    for name in ("README.md", "docs/PITCH_FINTECH.md"):
+    for name in ("docs/FINTECH_MODE.md", "docs/PITCH_FINTECH.md"):
         t = (ROOT / name).read_text(encoding="utf-8")
         ctrl = {int(x) for x in re.findall(r"(\d+)\s+(?:\*\*)?(?:финтех/ИБ-)?контрол", t)}
         aps = {int(x) for x in re.findall(r"(\d+)\s+(?:\*\*)?тип\w* опасных требований", t)}
@@ -396,7 +396,7 @@ def test_docs_numbers_match_knowledge_base():
 
 def test_pitch_states_measured_v2_numbers_and_names_holdout_v2():
     t = (ROOT / "docs" / "PITCH_FINTECH.md").read_text(encoding="utf-8")
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = (ROOT / "docs" / "FINTECH_MODE.md").read_text(encoding="utf-8")
     assert "балл растёт, критичные → 0" not in t        # вместо обещания — измеренные числа
     m = re.search(r"балл (\d+) → (\d+),\s*критичных (\d+) → (\d+)", t)
     assert m, "PITCH должен называть измеренные числа ТЗ v1 → v2"
@@ -408,7 +408,7 @@ def test_pitch_states_measured_v2_numbers_and_names_holdout_v2():
 
 
 def test_readme_formula_and_env_example():
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = (ROOT / "docs" / "FINTECH_MODE.md").read_text(encoding="utf-8")
     assert "max(0.5, уверенность)" in readme
     env = (ROOT / ".env.example").read_text(encoding="utf-8")
     assert "# LLM_TIMEOUT=600" in env and "# LLM_CALL_BUDGET=900" in env

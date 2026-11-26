@@ -11,7 +11,7 @@
   ```
   python validate.py examples/case_requirements.pdf reports/requirements_report.md
   ```
-- Откройте во вкладках: `reports/requirements_report.md`, `streamlit run app.py` (режим «ISO-ревью требований»),
+- Откройте во вкладках: `reports/requirements_report.md`, `streamlit run app.py` (загрузить PDF кейса),
   README с таблицей метрик.
 
 ## 1. Боль — 30 секунд

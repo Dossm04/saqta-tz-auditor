@@ -39,7 +39,39 @@ TOPIC_KW = {
     "ui": ("текст", "сообщени", "валидац"),
     "precondition": ("неактивн", "заблок", "перевыпуск", "валют"),
     "acceptance": ("критери", "приемк", "приёмк"),
+    "security": ("принадлеж", "лог", "query", "url", "маскир", "персональн", "pan", "push", "sms", "смс"),
+    "placeholder": ("не заполн", "позже", "открыт", "перечн", "тариф"),
+    "terms": ("не определ", "порог", "термин", "крупн", "значительн"),
+    "api": ("curl", "метод", "статус", "код", "пример"),
 }
+
+# ── безопасность API и уведомлений ─────────────────────────────────────────────
+_OWNERSHIP = re.compile(r"принадлеж|владел\w*|owner|соответств\w*\s+(?:клиент|сесси|токен)|из\s+(?:сесси|токен)", re.I)
+_ID_PARAM = re.compile(r"Parameter:\s*`?(\w*(?:Id|_id|ID))`?;", re.I)
+_PII_PARAM = re.compile(r"телефон|phone|\bиин\b|\biin\b|номер\w*\s+карт|\bpan\b|card\s*number|паспорт|фио|e-?mail", re.I)
+_PAN_PATH = re.compile(r"/\{?(?:pan|cardnumber|card_number|cardNumber)\}?|номер\w*\s+карт\w*[^.]{0,40}(?:в\s+(?:url|пут))", re.I)
+_LOG_SECRET = re.compile(r"(?:лог\w*|журнал\w*)[^.]{0,60}(?:полн\w*\s+url|url\s+(?:каждого\s+)?запрос|authorization|заголов\w*\s+авториз|токен)", re.I)
+_NOTIFY_SENSITIVE = re.compile(r"(?:push|sms|смс|уведомлени\w*)\w*\s+(?:[^.,\s]+\s+){0,4}?(?:с|со|содерж\w*|включа\w*|переда[её]т\w*|"
+                               r"указыва\w*|:)\s+[^.]{0,100}?(?:полн\w*\s+номер\w*\s+карт|номер\w*\s+карт\w*(?!\s*\(?(?:послед|маск))|остат\w*\s+(?:на\s+сч|задолж|баланс)|остат\w*|баланс\w*|\bиин\b|номер\w*\s+договор)", re.I)
+_MASKED = re.compile(r"маск|последн\w*\s+(?:4|четыр)", re.I)
+# ── незаполненные места и открытые перечни ─────────────────────────────────────
+_INLINE_HOLE = re.compile(r"(?:кроме|затем|включая|а также|далее|после этого)\s*[—–]\s*(?=[.,;)]|$)|заполня\w*\s+позже|будет\s+определ\w*\s+позже|"
+                          r"определ\w*\s+позднее", re.I)
+def _tbd_regex() -> re.Pattern:
+    from knowledge.language import VAGUE_TERMS
+
+    pats = [v.pattern for v in VAGUE_TERMS if v.kind == "tbd"]
+    return re.compile("|".join(f"(?:{p})" for p in pats) or r"(?!x)x", re.I)
+
+
+_TBD_ANY = _tbd_regex()
+_OPEN_REF = re.compile(r"по\s+тарифам\s+банка|по\s+решению\s+банка|прочи\w*\s+операци\w*|и\s+т\.\s?д\.|и\s+другие|и\s+прочее", re.I)
+_UNDEF_TERM = re.compile(r"\b(крупн\w+|значительн\w+|существенн\w+|небольш\w+|большо\w+)\s+(перевод\w*|сумм\w*|операци\w*|платеж\w*|платёж\w*|"
+                         r"погашени\w*|покупк\w*)", re.I)
+# ── объединение нескольких действий в одном пункте ─────────────────────────────
+_ACTIONS = re.compile(r"\b(провер\w+|показыва\w+|отправля\w+|записыва\w+|списыва\w+|зачисля\w+|формиру\w+|пересчитыва\w+|начисля\w+|"
+                      r"отража\w+|созда[её]т|блокиру\w+|уведомля\w+|сохраня\w+|рассчитыва\w+|предлага\w+|меняет|изменяет)", re.I)
+_MONEY_OP = re.compile(r"перевод|платеж|платёж|погашени|списани|transfer|payment|repay|payout|выплат", re.I)
 
 _TZ = re.compile(r"utc|gmt|asia/|часов\w* пояс|\+0?[3-6]:?00", re.I)
 _PERIOD = re.compile(r"\bмесяц|календарн|\bсутк|\bдата\b|\bдате\b|\bдаты\b|\bза день|полноч|\b\d{1,2}:\d{2}\b", re.I)
@@ -214,6 +246,48 @@ def unit_rules(seg: Segmentation, doc: Document) -> dict[str, list]:
                 "Сказано, что при ошибке ввода появляется сообщение, но не заданы правила валидации поля и тексты ошибок "
                 "(пустое значение, не число, вне диапазона).", u, [_snip(t, _UI_ERR.search(t), 10, 20)],
                 "Перечислить проверки поля и текст сообщения для каждой ошибки."))
+        # незаполненное место внутри формулировки и открытые перечни
+        mh = _INLINE_HOLE.search(t)
+        if mh and not _TBD_ANY.search(low):      # TBD уже отмечает Rule Checker
+            issues.append(_mk("complete", "major", "placeholder",
+                              "В формулировке оставлено незаполненное место — требование нельзя реализовать и проверить.",
+                              u, [_snip(t, mh, 30, 10)], "Дописать недостающее значение или перечень."))
+        mo = _OPEN_REF.search(t)
+        if mo and u.kind not in ("acceptance",):
+            issues.append(_mk("complete", "major", "placeholder",
+                              f"Значение задано открытой ссылкой («{mo.group(0)}»): нет конкретного размера или закрытого перечня, "
+                              "поэтому реализацию нельзя проверить.", u, [_snip(t, mo, 20, 15)],
+                              "Указать конкретные значения (или ссылку на документ с версией) и закрытый перечень."))
+        # термин-порог без определения
+        mu = _UNDEF_TERM.search(t)
+        if mu and not re.search(r"\d", re.sub(r"[ФF]-\d+", "", t)):
+            issues.append(_mk("unambiguous", "major", "terms",
+                              f"Термин «{mu.group(0)}» не определён: не задан порог, поэтому неясно, к каким операциям применяется правило.",
+                              u, [_snip(t, mu, 10, 20)], "Определить порог в тенге и описать процесс и сроки для таких операций."))
+        # несколько действий в одном предложении
+        if u.kind in ("functional", "business_rule") and len(re.split(r"(?<=[.!?])\s+(?=[А-ЯЁA-Z])", t.strip())) < 2:
+            acts = {m.group(1).lower()[:6] for m in _ACTIONS.finditer(t)}
+            if len(acts) >= 3:
+                issues.append(_mk("singular", "major", "terms",
+                                  f"В одном пункте объединены {len(acts)} самостоятельных действия — их нельзя независимо реализовать, "
+                                  "протестировать и проследить.", u, [" ".join(t.split()[:12])],
+                                  "Разбить на отдельные требования с собственными ID."))
+        # чувствительные данные в уведомлениях и логах, номер карты в URL
+        mn = _NOTIFY_SENSITIVE.search(t)
+        if mn and not _MASKED.search(mn.group(0)):
+            issues.append(_mk("security", "major", "security",
+                              "В уведомлении (push/SMS) передаются чувствительные данные: их видно на заблокированном экране и у оператора связи.",
+                              u, [_snip(t, mn, 0, 10)], "Передавать только маскированные данные (последние 4 цифры), без остатка и ИИН."))
+        ml = _LOG_SECRET.search(t)
+        if ml:
+            issues.append(_mk("security", "major", "security",
+                              "В логи пишутся полный URL или данные авторизации: персональные данные и токены попадут в журналы и системы мониторинга.",
+                              u, [_snip(t, ml, 10, 10)], "Логировать без query-строки и заголовков авторизации, маскировать персональные данные."))
+        mp = _PAN_PATH.search(t)
+        if mp:
+            issues.append(_mk("security", "critical", "security",
+                              "Номер карты (PAN) передаётся в URL: он попадёт в логи шлюза, прокси и браузера — нарушение PCI DSS.",
+                              u, [_snip(t, mp, 15, 15)], "Использовать внутренний идентификатор или токен карты, PAN — только в теле запроса по защищённому каналу."))
         # условие применимости без поведения вне условия
         if u.kind in ("functional", "business_rule") and _PRECOND.search(low) and not has_outside:
             issues.append(_mk(
@@ -222,7 +296,43 @@ def unit_rules(seg: Segmentation, doc: Document) -> dict[str, list]:
                 "карта в другой валюте, перевыпуск карты (переносится ли настройка и накопленная сумма).",
                 u, [_snip(t, _PRECOND.search(t), 10, 20)],
                 "Описать, что видит и что получает клиент для карт вне условия и при смене статуса карты."))
+    _api_unit_rules(seg, doc, out, has_idem_key)
     return out
+
+
+def _api_unit_rules(seg: Segmentation, doc: Document, out: dict[str, list], has_idem_key: bool) -> None:
+    """Безопасность и надёжность метода API: проверка владельца, ПДн в query, идемпотентность денежных операций."""
+    logic = [u for u in seg.units if u.kind == "api_logic"]
+    params = [u for u in seg.units if u.kind == "interface" and u.text.startswith("Parameter:")]
+    req_params = [u for u in params if re.search(r"query|path|запрос", u.section, re.I) and not re.search(r"ответ|response", u.section, re.I)]
+    id_params = [u for u in req_params if _ID_PARAM.search(u.text) or re.search(r"path", u.section, re.I)]
+    if logic and id_params and not any(_OWNERSHIP.search(u.text) for u in logic):
+        names = ", ".join(m.group(1) for u in id_params[:3] for m in [re.match(r"Parameter:\s*`?([\w.-]+)", u.text)] if m)
+        out[logic[0].rid].append(_mk(
+            "security", "critical", "security",
+            f"Логика метода не проверяет, что объект из запроса ({names}) принадлежит клиенту из сессии: подставив чужой "
+            "идентификатор, можно действовать с чужой картой или счётом (IDOR).", logic[0], [logic[0].quote.strip("| ")[:70]],
+            "Добавить шаг «проверить, что объект принадлежит клиенту из токена»; для чужого объекта возвращать 404.",
+            related=[u.rid for u in id_params[:3]]))
+    pii = [u for u in req_params if re.search(r"query", u.section, re.I) and _PII_PARAM.search(u.text)]
+    if pii:
+        names = ", ".join(re.match(r"Parameter:\s*`?([\w.-]+)", u.text).group(1) for u in pii[:4] if re.match(r"Parameter:\s*`?([\w.-]+)", u.text))
+        out[pii[0].rid].append(_mk(
+            "security", "major", "security",
+            f"Персональные данные ({names}) передаются в query-строке URL: они сохраняются в логах шлюза, прокси и истории браузера.",
+            pii[0], [pii[0].quote.strip("| ")[:70]], "Передавать персональные данные в теле запроса (POST) или брать из сессии.",
+            related=[u.rid for u in pii[1:4]]))
+    method_u = next((u for u in seg.units if u.kind == "interface" and re.search(r"rest type|http method|метод запроса", u.text, re.I)), None)
+    desc = " ".join(u.text for u in seg.units if u.kind == "interface" and re.search(r"description|request url|назначение", u.text, re.I))
+    if method_u and not has_idem_key and _MONEY_OP.search(desc):
+        curl = [u for u in seg.units if u.kind == "interface" and re.search(r"\bcurl\b", u.text, re.I)]
+        money_steps = [u for u in logic if re.search(r"списа|зачисл|погаси|перев[её]|начисл", u.text, re.I)]
+        out[method_u.rid].append(_mk(
+            "complete", "major", "idempotency",
+            "Метод проводит денежную операцию, но идемпотентность не определена: повтор запроса при таймауте приведёт к двойному списанию.",
+            method_u, [method_u.quote.strip("| ")[:60]],
+            "Ввести ключ идемпотентности (заголовок Idempotency-Key или идентификатор операции клиента) и описать ответ на повтор.",
+            related=[u.rid for u in curl[:1] + money_steps[:2]]))
 
 
 def set_rules(seg: Segmentation, doc: Document) -> list:
@@ -238,6 +348,20 @@ def set_rules(seg: Segmentation, doc: Document) -> list:
             if src and not acc_rx.search(acc_text):
                 gaps.append(f"{name} ({src[0].doc_ref})")
                 rel.append(src[0].rid)
+        # числовые лимиты и пороги из требований, ни одно значение которых не встречается в приёмке
+        acc_numbers = set(re.findall(r"\d+", re.sub(r"(?<=\d)[\s ](?=\d{3}\b)", "", acc_text)))
+        # только для критериев-сценариев (таблица «условия — действие — результат»), а не общих формулировок
+        scenario_acc = any(re.search(r"ожидаемый результат|исходные условия|действие:", x.text, re.I) for x in acc)
+        for u in (reqs if scenario_acc else []):
+            if u.rid in rel or not re.search(r"лимит|минимальн|максимальн|порог|комисси|не более|не менее|не позднее|срок", u.text, re.I):
+                continue
+            body = re.sub(r"[ФF]-\d+", "", u.text)
+            nums = set(re.findall(r"\d+", re.sub(r"(?<=\d)[\s ](?=\d{3}\b)", "", body)))
+            if nums and not nums & acc_numbers:
+                gaps.append(f"{u.doc_ref}: «{' '.join(u.text.split()[:8])}…»")
+                rel.append(u.rid)
+            if len(gaps) >= 6:
+                break
         for u in reqs:
             m = _RANGE.search(u.text)
             if m:
@@ -254,6 +378,44 @@ def set_rules(seg: Segmentation, doc: Document) -> list:
                 None, [first.quote.strip("| ")[:80]],
                 "Добавить сценарии приёмки на каждое правило, включая граничные значения и отрицательные случаи.",
                 related=list(dict.fromkeys(rel + [u.rid for u in acc])), lines=sorted({l for u in acc for l in u.lines})))
+    issues += _api_set_rules(seg, doc)
+    return issues
+
+
+def _api_set_rules(seg: Segmentation, doc: Document) -> list:
+    issues = []
+    iface = [u for u in seg.units if u.kind == "interface"]
+    # метод в CURL не совпадает с объявленным
+    method_u = next((u for u in iface if re.search(r"rest type|http method|метод запроса", u.text, re.I)), None)
+    curl_u = next((u for u in iface if re.search(r"\bcurl\b", u.text, re.I)), None)
+    if method_u and curl_u:
+        declared = re.search(r"\b(GET|POST|PUT|PATCH|DELETE)\b", method_u.text)
+        mx = re.search(r"-X\s+'?\"?(GET|POST|PUT|PATCH|DELETE)", curl_u.text)
+        used = mx.group(1) if mx else ("GET" if re.search(r"\scurl\s+-G\b|\s-G\s", " " + curl_u.text) else
+                                       "POST" if re.search(r"\s(?:-d|--data)\b", curl_u.text) else None)
+        if declared and used and declared.group(1) != used:
+            issues.append(_mk("set_consistent", "major", "api",
+                              f"Метод объявлен как {declared.group(1)}, а в примере CURL используется {used}: разработчик и тестировщик "
+                              "реализуют разные вызовы.", method_u, [method_u.quote.strip("| ")[:60], curl_u.quote.strip("| ")[:70]],
+                              "Привести CURL и объявленный метод к одному значению.", related=[method_u.rid, curl_u.rid],
+                              lines=sorted(set(method_u.lines + curl_u.lines))))
+    # перечень статусов не совпадает с примерами ответов
+    listed = {m.group(1): u for u in seg.units for m in [re.search(r"код (\d{3})$", u.doc_ref)] if m}
+    examples = {m.group(1): u for u in seg.units for m in [re.search(r"код (\d{3}), пример", u.doc_ref)] if m}
+    if listed and examples:
+        only_list = sorted(set(listed) - set(examples))
+        only_ex = sorted(set(examples) - set(listed))
+        if only_list or only_ex:
+            parts = []
+            if only_list:
+                parts.append(f"в перечне есть {', '.join(only_list)}, но нет примера ответа")
+            if only_ex:
+                parts.append(f"есть пример ответа {', '.join(only_ex)}, но код не описан в перечне")
+            us = [listed[c] for c in only_list] + [examples[c] for c in only_ex]
+            issues.append(_mk("set_consistent", "major", "api",
+                              "Перечень кодов ответа не совпадает с примерами: " + "; ".join(parts) + ".", us[0],
+                              [u.quote.strip("| ")[:60] for u in us[:2]], "Согласовать перечень кодов с примерами: у каждого кода — условие и пример.",
+                              related=[u.rid for u in us[:4]], lines=sorted({l for u in us[:4] for l in u.lines[:1]})))
     return issues
 
 

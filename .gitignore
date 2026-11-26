@@ -9,3 +9,5 @@ venv/
 *_review.md
 *_review.json
 .streamlit/secrets.toml
+
+.claude/

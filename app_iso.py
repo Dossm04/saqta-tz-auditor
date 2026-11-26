@@ -8,7 +8,7 @@ import streamlit as st
 
 from agents.iso_review import IsoReport, review_document
 from knowledge.iso29148 import BY_CODE, INDIVIDUAL, SECURITY, SET, SEVERITY_ICON, SEVERITY_LABEL, STATUS_ICON
-from parsing import Document, load_bytes, load_path, load_text
+from parsing import Document, load_bytes, load_text
 from report_iso import to_markdown
 
 AGENTS = [
@@ -27,17 +27,11 @@ def _color(level: str) -> str:
 def render(cfg, use_llm: bool, root: Path) -> None:
     ss = st.session_state
     st.title("Агент проверки требований")
-    st.caption("Статическая проверка документа требований до разработки: ISO/IEC/IEEE 29148:2018 (п. 5.2.5, 5.2.6) и IEEE 830-1998 (п. 4.3). "
-               "Нарезка требований → проверка каждого → проверка набора → сводка и итог.")
-    samples = {"Документ кейса (PDF)": root / "examples" / "case_requirements.pdf",
-               "Документ кейса (Markdown)": root / "examples" / "case_requirements.md"}
-    samples = {k: v for k, v in samples.items() if v.exists()}
-    src = st.radio("Документ требований", [*samples, "Загрузить файл", "Вставить текст"], horizontal=True, key="iso_src")
+    st.caption("Загрузите документ требований: агент проверит его по ISO/IEC/IEEE 29148 и IEEE 830 и составит отчёт.")
+    src = st.radio("Документ", ["Загрузить файл", "Вставить текст"], horizontal=True, key="iso_src", label_visibility="collapsed")
     doc: Document | None = None
     try:
-        if src in samples:
-            doc = load_path(samples[src])
-        elif src == "Загрузить файл":
+        if src == "Загрузить файл":
             up = st.file_uploader("PDF, DOCX, MD или TXT", type=["pdf", "docx", "md", "txt"], key="iso_up")
             if up is not None:
                 doc = load_bytes(up.getvalue(), up.name)
@@ -76,7 +70,7 @@ def render(cfg, use_llm: bool, root: Path) -> None:
 
     r: IsoReport | None = ss.get("iso_report")
     if r is None:
-        st.info("Выберите документ и нажмите «Проверить требования».")
+        st.info("Загрузите документ и нажмите «Проверить требования».")
         return
     s = r.stats
     st.divider()

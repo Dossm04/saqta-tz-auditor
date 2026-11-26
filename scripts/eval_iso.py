@@ -80,7 +80,25 @@ def main() -> int:
     ap.add_argument("--llm", action="store_true")
     ap.add_argument("--report", help="готовый JSON-отчёт validate.py --json (по .md документа кейса)")
     ap.add_argument("--min-recall", type=float, default=0.0)
+    ap.add_argument("--blind", action="store_true", help="слепые документы eval/iso/blind/*.json вместо документа кейса")
+    ap.add_argument("--split", choices=["dev", "holdout", "all"], default="all", help="какие слепые документы брать")
     a = ap.parse_args()
+    if a.blind:
+        cfg = LLMConfig.from_env()
+        files = sorted((ROOT / "eval" / "iso" / "blind").glob("*.json"))
+        if a.split != "all":
+            files = [f for f in files if f.stem.startswith(a.split + "_")]
+        tf = tt = 0
+        for f in files:
+            exp = json.loads(f.read_text(encoding="utf-8"))
+            rep = review_document(load_path(ROOT / exp["sample"]), cfg, use_llm=a.llm and cfg.enabled)
+            found, total, missed = evaluate(rep, exp)
+            tf, tt = tf + found, tt + total
+            print(f"{f.stem}: {found}/{total} ({found / total:.0%}); режим: {rep.mode}; нарушений: {rep.stats['issues_total']}")
+            for m in missed:
+                print("    пропущено:", m)
+        print(f"ИТОГО слепые документы ({a.split}): {tf}/{tt} ({tf / max(tt, 1):.0%})")
+        return 0 if tt and tf / tt >= a.min_recall else (0 if not tt else 1)
     expected = json.loads((ROOT / "eval" / "iso" / "case_requirements.json").read_text(encoding="utf-8"))
     if a.report:
         report = IsoReport.model_validate_json(Path(a.report).read_text(encoding="utf-8"))
